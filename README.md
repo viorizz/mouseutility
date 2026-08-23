@@ -37,7 +37,7 @@ irm https://raw.githubusercontent.com/viorizz/mouseutility/main/install.ps1 | ie
 | battery | `0x1004` unified, `0x1000` status, `0x1001` voltage |
 | DPI, supported ranges, onboard levels — **read and set** | `0x2202` extended, `0x2201` adjustable |
 | report rate, supported list — **read and set** | `0x8061` extended (active link), `0x8060` |
-| onboard-profiles mode | `0x8100` |
+| onboard-profiles mode, active DPI level — **read and set** | `0x8100` |
 
 A paired mouse that is asleep or switched off shows as **offline**; the panel
 re-polls every few seconds and picks it up when it wakes. Unifying,
@@ -60,6 +60,7 @@ it may revert a host-set DPI on its own — the DPI dialog says so.
 | `↑` `↓` | select a device |
 | `d` | set DPI — type a value, `←` `→` step through onboard levels |
 | `p` | set report rate — pick from what the mouse supports |
+| `o` | onboard DPI levels — make one the active level |
 | `r` | rescan |
 | `Shift+U` | check for / install an update |
 | `c` | copy the session log to the clipboard |

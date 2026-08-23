@@ -25,9 +25,6 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--list" || a == "-l") {
         return list();
     }
-    if std::env::args().any(|a| a == "--profile-selftest") {
-        return profile_selftest();
-    }
     if let Some(pos) = std::env::args().position(|a| a == "--call") {
         return call(std::env::args().skip(pos + 1).collect());
     }
@@ -114,33 +111,6 @@ fn first_online() -> anyhow::Result<(hidpp::Receiver, hidpp::Device)> {
         }
     }
     anyhow::bail!("no online device")
-}
-
-/// `--profile-selftest` — development check for the onboard-profile write
-/// path: rewrites a *disabled* profile sector with its own current bytes (a
-/// no-op) and verifies the read-back, leaving every enabled profile alone.
-fn profile_selftest() -> anyhow::Result<()> {
-    let (r, d) = first_online()?;
-    let dir = r.link.read_profile(d.index, 0)?;
-    let enabled: Vec<u16> = dir
-        .chunks(4)
-        .take_while(|e| e.len() >= 3 && !(e[0] == 0xff && e[1] == 0xff))
-        .filter(|e| e[2] != 0)
-        .map(|e| u16::from_be_bytes([e[0], e[1]]))
-        .collect();
-    let disabled = dir
-        .chunks(4)
-        .take_while(|e| e.len() >= 3 && !(e[0] == 0xff && e[1] == 0xff))
-        .find(|e| e[2] == 0)
-        .map(|e| u16::from_be_bytes([e[0], e[1]]))
-        .ok_or_else(|| anyhow::anyhow!("no disabled profile sector to test on"))?;
-    println!("enabled sectors: {enabled:04x?}; testing on disabled {disabled:#06x}");
-    let before = r.link.read_profile(d.index, disabled)?;
-    r.link.write_profile(d.index, disabled, &before)?;
-    let after = r.link.read_profile(d.index, disabled)?;
-    anyhow::ensure!(before == after, "read-back differs after no-op rewrite");
-    println!("no-op rewrite of {disabled:#06x} verified ({} bytes, levels {:?})", before.len(), hidpp::profile_levels(&before));
-    Ok(())
 }
 
 /// `mouseutility --call <feature-hex> <fn> [param hex bytes…]` — raw HID++ 2.0

@@ -6,10 +6,14 @@ extracts it as the GitHub release notes and fails without one.
 ## v0.3.0
 
 ### Added
+- **Onboard DPI levels modal** (`o`): the levels the DPI button cycles through, current one highlighted; Enter makes the selected level active — via `0x8100` setCurrentDpiIndex when the mouse runs its onboard profile, as a plain DPI write in host mode.
 - **Low-battery toast**: when a mouse drops to `low_battery_percent` (config, default 20; 0 disables) while discharging, a Windows toast fires once per session per device (re-armed once it charges back above the threshold) and the status line turns red. Honours the shared `notify` setting.
 - **Battery history sparkline** in the details panel, built from the 4 s polls (last ~16 min), with min–max and the toast threshold as a caption.
 - Shell-driven tests: the DPI / report-rate modals and the low-battery warning are exercised through the full key stack with an offline shell and rendered frames.
 - **Direct-connected devices**: Logitech devices plugged in over USB (vendor page `0xFF00` on a non-receiver product id) or paired over Bluetooth (`0xFF43`, long reports only) are enumerated beside receivers and probed at device index `0xFF`, with the kind from `0x0005` getDeviceType. Read-only and untested on real hardware so far — no such device was available; please report what you see.
+
+### Not done, deliberately
+- Rewriting the DPI levels *stored* in the onboard profile: the G PRO X2 SUPERSTRIKE accepts the documented `0x8100` startWrite/writeData sequence but always rejects endWrite with error 0x04 (tried counts 4–0x1000, onboard and host mode, with and without G HUB running). Until that is understood, profile memory stays read-only — the levels shown come from `0x2202`.
 
 ### Changed
 - Built on **utility-core v0.2.0**: the app loop, update dialog, help overlay, status line and snapshot renderer now come from `utility_core::shell`; MouseUtility only carries its panels, keys and its own modals.
