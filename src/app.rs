@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use utility_core::config::CoreSettings;
 use utility_core::{logger, update};
 
-use crate::hidpp::{self, Device};
+use crate::hidpp::{self, Device, Dpi, Receiver as HidReceiver};
 use crate::ui;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -29,12 +29,18 @@ pub enum AppEvent {
     Progress(String),
     Finished(Result<String, String>),
     Scanned(Result<Vec<ReceiverInfo>, String>),
+    /// A write finished; the string describes what changed.
+    Applied(Result<String, String>),
 }
 
 pub enum Modal {
     None,
     Help,
     Update { steps: Vec<String>, done: Option<Result<String, String>> },
+    /// Type a DPI; `←`/`→` step through onboard levels. Enter applies the snapped value.
+    Dpi { input: String },
+    /// Pick a report rate from the supported list.
+    Rate { sel: usize },
 }
 
 pub struct App {
@@ -49,6 +55,8 @@ pub struct App {
     /// Selected entry in the flattened device list.
     pub sel: usize,
     pub scanning: bool,
+    /// A write is in flight; refuse another until it finishes.
+    pub applying: bool,
     pub last_scan: Option<Instant>,
     quit: bool,
     tx: Sender<AppEvent>,
@@ -69,6 +77,7 @@ impl App {
             scan_error: None,
             sel: 0,
             scanning: false,
+            applying: false,
             last_scan: None,
             quit: false,
             tx,
@@ -175,6 +184,14 @@ impl App {
                     *done = Some(r);
                 }
             }
+            AppEvent::Applied(r) => {
+                self.applying = false;
+                match r {
+                    Ok(msg) => self.set_status(msg, false),
+                    Err(e) => self.set_status(e, true),
+                }
+                self.rescan();
+            }
             AppEvent::Scanned(r) => {
                 self.scanning = false;
                 self.last_scan = Some(Instant::now());
@@ -199,8 +216,16 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        // The input modals need both the selection and the modal state, so
+        // take them out of `self` first.
+        match std::mem::replace(&mut self.modal, Modal::None) {
+            Modal::Dpi { input } => return self.on_key_dpi(k, input),
+            Modal::Rate { sel } => return self.on_key_rate(k, sel),
+            other => self.modal = other,
+        }
         match &mut self.modal {
             Modal::Help => self.modal = Modal::None,
+            Modal::Dpi { .. } | Modal::Rate { .. } => unreachable!(),
             Modal::Update { done, .. } => match (k.code, done.as_ref()) {
                 (KeyCode::Char('a'), Some(Ok(_))) => {
                     self.cfg.core.auto_update = !self.cfg.core.auto_update;
@@ -240,10 +265,113 @@ impl App {
                         self.rescan();
                         self.set_status("rescanning…", false);
                     }
+                    (KeyCode::Char('d'), _) => match self.selected() {
+                        Some((_, d)) if d.online && d.dpi.is_some() => {
+                            let cur = d.dpi.as_ref().map(|x| x.current).unwrap_or(0);
+                            self.modal = Modal::Dpi { input: cur.to_string() };
+                        }
+                        Some((_, d)) if !d.online => self.set_status("device is offline — move the mouse to wake it", true),
+                        _ => self.set_status("this device does not expose an adjustable DPI", true),
+                    },
+                    (KeyCode::Char('p'), _) => match self.selected() {
+                        Some((_, d)) if d.online && d.report_rate.as_ref().is_some_and(|r| !r.supported.is_empty()) => {
+                            let rr = d.report_rate.as_ref().unwrap();
+                            let sel = rr.supported.iter().position(|&h| h == rr.hz).unwrap_or(0);
+                            self.modal = Modal::Rate { sel };
+                        }
+                        Some((_, d)) if !d.online => self.set_status("device is offline — move the mouse to wake it", true),
+                        _ => self.set_status("this device does not expose an adjustable report rate", true),
+                    },
                     _ => {}
                 }
             }
         }
+    }
+
+    fn on_key_dpi(&mut self, k: KeyEvent, mut input: String) {
+        let sel = self.selected().map(|(ri, d)| (self.receivers[ri].pid, d.clone()));
+        let dpi = sel.as_ref().and_then(|(_, d)| d.dpi.clone());
+        match k.code {
+            KeyCode::Esc => return,
+            KeyCode::Char(c) if c.is_ascii_digit() && input.len() < 5 => input.push(c),
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Left | KeyCode::Right => {
+                if let Some(dpi) = &dpi {
+                    let cur: u16 = input.parse().unwrap_or(dpi.current);
+                    let next = if k.code == KeyCode::Left {
+                        dpi.presets.iter().rev().find(|&&p| p < cur).copied()
+                    } else {
+                        dpi.presets.iter().find(|&&p| p > cur).copied()
+                    };
+                    if let Some(n) = next {
+                        input = n.to_string();
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if let (Ok(v), Some(dpi), Some((pid, d))) = (input.parse::<u16>(), dpi, sel) {
+                    let v = dpi.snap(v);
+                    if v == dpi.current {
+                        self.set_status(format!("DPI is already {v}"), false);
+                        return;
+                    }
+                    self.start_write(
+                        move |r| {
+                            let mut d = d;
+                            apply_dpi(r, &mut d, &dpi, v)
+                        },
+                        pid,
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.modal = Modal::Dpi { input };
+    }
+
+    fn on_key_rate(&mut self, k: KeyEvent, mut sel: usize) {
+        let target = self.selected().map(|(ri, d)| (self.receivers[ri].pid, d.clone()));
+        let rates = target.as_ref().and_then(|(_, d)| d.report_rate.clone()).map(|r| r.supported).unwrap_or_default();
+        match k.code {
+            KeyCode::Esc => return,
+            KeyCode::Left | KeyCode::Up => sel = sel.saturating_sub(1),
+            KeyCode::Right | KeyCode::Down => sel = (sel + 1).min(rates.len().saturating_sub(1)),
+            KeyCode::Enter => {
+                if let (Some(&hz), Some((pid, d))) = (rates.get(sel), target) {
+                    if d.report_rate.as_ref().is_some_and(|r| r.hz == hz) {
+                        self.set_status(format!("report rate is already {hz} Hz"), false);
+                        return;
+                    }
+                    self.start_write(
+                        move |r| {
+                            let mut d = d;
+                            apply_rate(r, &mut d, hz)
+                        },
+                        pid,
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.modal = Modal::Rate { sel };
+    }
+
+    /// Run a write against the receiver `pid` on a worker thread.
+    fn start_write(&mut self, job: impl FnOnce(&HidReceiver) -> Result<String, String> + Send + 'static, pid: u16) {
+        if self.applying {
+            self.set_status("a change is still being applied", true);
+            return;
+        }
+        self.applying = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let r = hidpp::receiver(pid).and_then(|r| job(&r));
+            let _ = tx.send(AppEvent::Applied(r));
+        });
     }
 
     fn start_update(&mut self) {
@@ -256,4 +384,36 @@ impl App {
             let _ = tx.send(AppEvent::Finished(r));
         });
     }
+}
+
+/// Set the DPI and read it back; the message reports old → new.
+pub fn apply_dpi(r: &HidReceiver, d: &mut Device, dpi: &Dpi, value: u16) -> Result<String, String> {
+    let old = dpi.current;
+    r.link.set_dpi(d.index, dpi, value).map_err(|e| format!("set dpi: {e}"))?;
+    let now = r.link.dpi(d.index).map_err(|e| format!("read back: {e}"))?;
+    logger::log(format!("dpi: slot {} {old} → {value} (device reports {})", d.index, now.current));
+    if now.current != value {
+        return Err(format!("device kept {} instead of {value}", now.current));
+    }
+    d.dpi = Some(now);
+    let note = if d.onboard_mode == Some(1) { " (onboard profile active — may not persist)" } else { "" };
+    Ok(format!("DPI {old} → {value}{note}"))
+}
+
+/// Set the report rate and read it back.
+pub fn apply_rate(r: &HidReceiver, d: &mut Device, hz: u16) -> Result<String, String> {
+    let old = d.report_rate.as_ref().map(|x| x.hz).unwrap_or(0);
+    if let Some(rr) = &d.report_rate {
+        if !rr.supported.is_empty() && !rr.supported.contains(&hz) {
+            return Err(format!("{hz} Hz is not supported; the mouse offers {:?}", rr.supported));
+        }
+    }
+    r.link.set_report_rate(d.index, hz).map_err(|e| format!("set report rate: {e}"))?;
+    let now = r.link.report_rate(d.index).map_err(|e| format!("read back: {e}"))?;
+    logger::log(format!("report rate: slot {} {old} → {hz} Hz (device reports {})", d.index, now.hz));
+    if now.hz != hz {
+        return Err(format!("device kept {} Hz instead of {hz} Hz", now.hz));
+    }
+    d.report_rate = Some(now);
+    Ok(format!("report rate {old} → {hz} Hz"))
 }

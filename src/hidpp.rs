@@ -1,4 +1,4 @@
-//! Logitech HID++ over `hidapi`, read-only.
+//! Logitech HID++ over `hidapi`.
 //!
 //! A receiver (Unifying / Lightspeed / Bolt) exposes two vendor collections on
 //! usage page 0xFF00: usage 1 carries short reports (0x10, 7 bytes), usage 2
@@ -11,6 +11,12 @@
 //! devices (index 1..=6) speak HID++ 2.0 features. A paired device that is
 //! asleep or switched off answers the ping with HID++ 1.0 error 0x08
 //! ("unknown device") — reported here as `online = false`, not as a failure.
+//!
+//! Writes (`set_dpi`, `set_report_rate`) were verified on a G PRO X2
+//! SUPERSTRIKE over Lightspeed: `0x2202` fn 6 takes
+//! `sensor, dpiX, dpiY, lod`; `0x8061` fn 3 takes the rate code as its *first*
+//! byte and applies it to the active (wireless) link — the connection-type
+//! byte used by the getters is not the first parameter there.
 
 use std::time::Duration;
 
@@ -170,38 +176,18 @@ impl Link {
         let current = u16::from_be_bytes([r[1], r[2]]);
         let default = u16::from_be_bytes([r[3], r[4]]);
         let l = self.call(idx, f, 1, &[0])?;
-        let mut min = 0;
-        let mut max = 0;
-        let mut step = 0;
-        let mut i = 1;
-        let mut last = 0u16;
-        while i + 1 < 16 {
-            let v = u16::from_be_bytes([l[i], l[i + 1]]);
-            if v == 0 {
-                break;
-            }
-            if v & 0xe000 == 0xe000 {
-                step = v & 0x1fff;
-            } else {
-                if min == 0 {
-                    min = v;
-                }
-                last = v;
-            }
-            i += 2;
-        }
-        if last > 0 {
-            max = last;
-        }
-        Ok(Dpi { current, default, min, max, step })
+        Ok(Dpi { current, default, segments: parse_dpi_list(&l[1..]), presets: Vec::new(), lod: 0 })
     }
 
-    /// 0x2202 Extended Adjustable DPI: getSensorDpi (fn 5) → sensor, dpiX, dpiY,
-    /// lod; getSensorDpiRanges (fn 2: sensor, direction, index) → list of
-    /// u16 where 0xE000|n encodes a step between the surrounding values.
+    /// 0x2202 Extended Adjustable DPI: getSensorDpiParameters (fn 5) →
+    /// sensor, dpiX, defaultX, dpiY, defaultY, lod; getSensorDpiRanges (fn 2:
+    /// sensor, direction, index) → list of u16 where 0xE000|n encodes the step
+    /// between the surrounding values; getSensorDpiList (fn 3) → preset levels.
     fn dpi_extended(&self, idx: u8, f: u8) -> Result<Dpi> {
         let r = self.call(idx, f, 5, &[0])?;
         let current = u16::from_be_bytes([r[1], r[2]]);
+        let default = u16::from_be_bytes([r[3], r[4]]);
+        let lod = r[9];
         // The range list is one stream of big-endian u16 split across
         // successive replies (13 payload bytes each), terminated by 0x0000.
         let mut stream = Vec::new();
@@ -212,41 +198,107 @@ impl Link {
                 break;
             }
         }
-        let mut min = 0;
-        let mut max = 0;
-        let mut step = 0;
-        for c in stream.chunks(2) {
-            if c.len() < 2 {
-                break;
-            }
-            let v = u16::from_be_bytes([c[0], c[1]]);
-            if v == 0 {
-                break;
-            }
-            if v & 0xe000 == 0xe000 {
-                step = v & 0x1fff;
-            } else {
-                if min == 0 {
-                    min = v;
-                }
-                max = max.max(v);
-            }
-        }
-        Ok(Dpi { current, default: 0, min, max, step })
+        let presets = match self.call(idx, f, 3, &[0, 0]) {
+            Ok(l) => l[2..16]
+                .chunks(2)
+                .filter(|c| c.len() == 2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .take_while(|&v| v != 0)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        Ok(Dpi { current, default, segments: parse_dpi_list(&stream), presets, lod })
     }
 
-    /// Report rate in Hz (0x8060 legacy or 0x8061 extended).
-    pub fn report_rate(&self, idx: u8) -> Result<u16> {
+    /// Write a new DPI (both axes). `value` should already be snapped with
+    /// [`Dpi::snap`]; the device rejects unsupported values with error 0x02.
+    pub fn set_dpi(&self, idx: u8, dpi: &Dpi, value: u16) -> Result<()> {
+        let [hi, lo] = value.to_be_bytes();
+        if let Ok(f) = self.feature_index(idx, 0x2202) {
+            self.call(idx, f, 6, &[0, hi, lo, hi, lo, dpi.lod])?;
+            return Ok(());
+        }
+        let f = self.feature_index(idx, 0x2201)?;
+        self.call(idx, f, 3, &[0, hi, lo])?;
+        Ok(())
+    }
+
+    /// Report rate (0x8061 extended or 0x8060 legacy). On 0x8061 the active
+    /// wireless link (connection type 1) is read first, wired (0) as fallback.
+    pub fn report_rate(&self, idx: u8) -> Result<ReportRate> {
         if let Ok(f) = self.feature_index(idx, 0x8061) {
-            let r = self.call(idx, f, 2, &[])?;
-            // extended: 0=8ms 1=4ms 2=2ms 3=1ms 4=500us 5=250us 6=125us
-            let hz = match r[0] { 0 => 125, 1 => 250, 2 => 500, 3 => 1000, 4 => 2000, 5 => 4000, 6 => 8000, _ => 0 };
-            return Ok(hz);
+            let (ct, r) = match self.call(idx, f, 2, &[1]) {
+                Ok(r) => (1u8, r),
+                Err(_) => (0u8, self.call(idx, f, 2, &[0])?),
+            };
+            // Reply: connection type echo, then a bitmask of supported rate codes.
+            let mask = self.call(idx, f, 1, &[ct]).map(|l| l[1]).unwrap_or(0);
+            let supported = (0..7u8).filter(|b| mask & (1 << b) != 0).map(ext_rate_hz).collect();
+            return Ok(ReportRate { hz: ext_rate_hz(r[0]), supported });
         }
         let f = self.feature_index(idx, 0x8060)?;
+        let mask = self.call(idx, f, 0, &[])?[0];
         let r = self.call(idx, f, 1, &[])?;
-        Ok(if r[0] == 0 { 0 } else { 1000 / r[0] as u16 })
+        let supported = (0..8u8).filter(|b| mask & (1 << b) != 0).map(|b| 1000 / (b as u16 + 1)).collect();
+        Ok(ReportRate { hz: if r[0] == 0 { 0 } else { 1000 / r[0] as u16 }, supported })
     }
+
+    pub fn set_report_rate(&self, idx: u8, hz: u16) -> Result<()> {
+        if let Ok(f) = self.feature_index(idx, 0x8061) {
+            let code = (0..7u8).find(|&c| ext_rate_hz(c) == hz).ok_or(HidppError::V2(0x02))?;
+            self.call(idx, f, 3, &[code])?;
+            return Ok(());
+        }
+        let f = self.feature_index(idx, 0x8060)?;
+        let ms = (1000 / hz.max(1)).clamp(1, 8) as u8;
+        self.call(idx, f, 2, &[ms])?;
+        Ok(())
+    }
+
+    /// 0x8100 Onboard Profiles mode: 1 = onboard (the mouse runs its stored
+    /// profile and may override host DPI), 2 = host. `None` without the feature.
+    pub fn onboard_mode(&self, idx: u8) -> Option<u8> {
+        let f = self.feature_index(idx, 0x8100).ok()?;
+        self.call(idx, f, 2, &[]).ok().map(|r| r[0])
+    }
+}
+
+/// 0x8061 rate code → Hz: 0=8ms 1=4ms 2=2ms 3=1ms 4=500µs 5=250µs 6=125µs.
+fn ext_rate_hz(code: u8) -> u16 {
+    match code { 0 => 125, 1 => 250, 2 => 500, 3 => 1000, 4 => 2000, 5 => 4000, 6 => 8000, _ => 0 }
+}
+
+/// Decode a DPI list stream: values, with `0xE000 | step` between two values
+/// meaning "every `step` from the previous value to the next".
+fn parse_dpi_list(bytes: &[u8]) -> Vec<DpiSegment> {
+    let mut out = Vec::new();
+    let mut prev: Option<u16> = None;
+    let mut pending_step = 0u16;
+    for c in bytes.chunks(2) {
+        if c.len() < 2 {
+            break;
+        }
+        let v = u16::from_be_bytes([c[0], c[1]]);
+        if v == 0 {
+            break;
+        }
+        if v & 0xe000 == 0xe000 {
+            pending_step = v & 0x1fff;
+            continue;
+        }
+        match prev {
+            Some(from) if pending_step > 0 => out.push(DpiSegment { from, to: v, step: pending_step }),
+            // A bare value with no step before it is a discrete level.
+            _ => out.push(DpiSegment { from: v, to: v, step: 1 }),
+        }
+        pending_step = 0;
+        prev = Some(v);
+    }
+    // Collapse a leading discrete entry that is really the start of a range.
+    if out.len() > 1 && out[0].from == out[0].to && out[0].to == out[1].from {
+        out.remove(0);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,13 +316,55 @@ pub struct Battery {
     pub status: ChargeState,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// `from..=to` every `step` DPI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DpiSegment {
+    pub from: u16,
+    pub to: u16,
+    pub step: u16,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Dpi {
     pub current: u16,
     pub default: u16,
-    pub min: u16,
-    pub max: u16,
-    pub step: u16,
+    pub segments: Vec<DpiSegment>,
+    /// Onboard DPI levels (0x2202 only).
+    pub presets: Vec<u16>,
+    /// Lift-off distance, passed back unchanged on write.
+    pub lod: u8,
+}
+
+impl Dpi {
+    pub fn min(&self) -> u16 {
+        self.segments.first().map_or(0, |s| s.from)
+    }
+    pub fn max(&self) -> u16 {
+        self.segments.last().map_or(0, |s| s.to)
+    }
+    /// Nearest value the sensor accepts.
+    pub fn snap(&self, v: u16) -> u16 {
+        if self.segments.is_empty() {
+            return v;
+        }
+        let v = v.clamp(self.min(), self.max());
+        for s in &self.segments {
+            if v >= s.from && v <= s.to {
+                let k = (v - s.from + s.step / 2) / s.step;
+                return (s.from + k * s.step).min(s.to);
+            }
+        }
+        // In a gap between segments: pick the closer boundary.
+        let below = self.segments.iter().filter(|s| s.to <= v).map(|s| s.to).max().unwrap_or(self.min());
+        let above = self.segments.iter().filter(|s| s.from >= v).map(|s| s.from).min().unwrap_or(self.max());
+        if v - below <= above - v { below } else { above }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReportRate {
+    pub hz: u16,
+    pub supported: Vec<u16>,
 }
 
 /// A slot in a receiver's pairing table, plus whatever the device answered.
@@ -288,7 +382,9 @@ pub struct Device {
     pub name: Option<String>,
     pub battery: Option<Battery>,
     pub dpi: Option<Dpi>,
-    pub report_rate: Option<u16>,
+    pub report_rate: Option<ReportRate>,
+    /// 0x8100 onboard-profiles mode (1 onboard, 2 host), if the feature exists.
+    pub onboard_mode: Option<u8>,
     pub error: Option<String>,
 }
 
@@ -352,6 +448,7 @@ impl Receiver {
                 battery: None,
                 dpi: None,
                 report_rate: None,
+                onboard_mode: None,
                 error: None,
             };
             self.probe(&mut d);
@@ -371,6 +468,7 @@ impl Receiver {
                 d.battery = self.link.battery(d.index).ok();
                 d.dpi = self.link.dpi(d.index).ok();
                 d.report_rate = self.link.report_rate(d.index).ok();
+                d.onboard_mode = self.link.onboard_mode(d.index);
             }
             Ok(None) => {
                 d.online = false;
@@ -424,9 +522,58 @@ pub fn receivers() -> std::result::Result<Vec<Receiver>, String> {
         .collect())
 }
 
+/// Open receivers and return the one with `pid` (first match).
+pub fn receiver(pid: u16) -> std::result::Result<Receiver, String> {
+    receivers()?.into_iter().find(|r| r.pid == pid).ok_or_else(|| format!("receiver {pid:04x} not found"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Range stream captured from a G PRO X2 SUPERSTRIKE (0x2202 fn 2, three replies).
+    const X2_RANGES: &[u8] = &[
+        0x00, 0x64, 0xe0, 0x01, 0x00, 0xc8, 0xe0, 0x02, 0x01, 0xf4, 0xe0, 0x05, 0x03, 0xe8, 0xe0, 0x0a, 0x07, 0xd0, 0xe0, 0x14,
+        0x13, 0x88, 0xe0, 0x32, 0x27, 0x10, 0xe0, 0x64, 0x4e, 0x20, 0xe0, 0x7d, 0x7d, 0x00, 0xe0, 0xc8, 0xab, 0xe0, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn dpi_ranges_decode() {
+        let segs = parse_dpi_list(X2_RANGES);
+        assert_eq!(segs.len(), 9);
+        assert_eq!(segs[0], DpiSegment { from: 100, to: 200, step: 1 });
+        assert_eq!(segs[3], DpiSegment { from: 1000, to: 2000, step: 10 });
+        assert_eq!(segs[8], DpiSegment { from: 32000, to: 44000, step: 200 });
+    }
+
+    #[test]
+    fn dpi_snap() {
+        let dpi = Dpi { segments: parse_dpi_list(X2_RANGES), ..Default::default() };
+        assert_eq!((dpi.min(), dpi.max()), (100, 44000));
+        assert_eq!(dpi.snap(1600), 1600);
+        assert_eq!(dpi.snap(1604), 1600);
+        assert_eq!(dpi.snap(1606), 1610);
+        assert_eq!(dpi.snap(5), 100);
+        assert_eq!(dpi.snap(60000), 44000);
+        assert_eq!(dpi.snap(33333), 33400);
+        assert_eq!(dpi.snap(25010), 25000);
+    }
+
+    #[test]
+    fn dpi_discrete_list() {
+        // 0x2201 style: 800, 1600, 3200 with no steps.
+        let segs = parse_dpi_list(&[0x03, 0x20, 0x06, 0x40, 0x0c, 0x80, 0, 0]);
+        assert_eq!(segs.len(), 3);
+        let dpi = Dpi { segments: segs, ..Default::default() };
+        assert_eq!(dpi.snap(1000), 800);
+        assert_eq!(dpi.snap(1300), 1600);
+    }
+
+    #[test]
+    fn rate_codes() {
+        assert_eq!(ext_rate_hz(3), 1000);
+        assert_eq!(ext_rate_hz(6), 8000);
+    }
 
     #[test]
     fn receiver_kinds() {

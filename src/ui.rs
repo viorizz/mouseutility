@@ -11,7 +11,7 @@ use crate::APP;
 
 pub const THEME: Theme = Theme::MOUSE;
 
-const HINTS: &[Hint] = &[("↑↓", "select"), ("r", "rescan"), ("U", "update"), ("c", "log"), ("?", "help"), ("q", "quit")];
+const HINTS: &[Hint] = &[("↑↓", "select"), ("d", "dpi"), ("p", "rate"), ("r", "rescan"), ("U", "update"), ("c", "log"), ("?", "help"), ("q", "quit")];
 
 /// A small mouse, top view.
 const MOUSE_ART: [&str; 9] = [
@@ -43,6 +43,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::None => {}
         Modal::Help => draw_help(f, area),
         Modal::Update { steps, done } => draw_update(f, area, app, steps, done.as_ref()),
+        Modal::Dpi { input } => draw_dpi(f, area, app, input),
+        Modal::Rate { sel } => draw_rate(f, area, app, *sel),
     }
 }
 
@@ -157,17 +159,36 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
     if let Some((maj, min)) = d.protocol {
         lines.push(Line::from(vec![label("protocol"), val(format!("HID++ {maj}.{min}"))]));
     }
-    if let Some(dpi) = d.dpi {
-        let range = if dpi.max > 0 {
-            format!("  (range {}–{})", dpi.min, dpi.max)
-        } else {
-            String::new()
-        };
-        let default = if dpi.default > 0 { format!("  default {}", dpi.default) } else { String::new() };
-        lines.push(Line::from(vec![label("dpi"), val(format!("{}{range}", dpi.current)), THEME.dim(default)]));
+    if let Some(dpi) = &d.dpi {
+        let mut notes = Vec::new();
+        if dpi.max() > 0 {
+            notes.push(format!("{}–{}", dpi.min(), dpi.max()));
+        }
+        if dpi.default > 0 {
+            notes.push(format!("default {}", dpi.default));
+        }
+        let notes = if notes.is_empty() { String::new() } else { format!("  ({})", notes.join(", ")) };
+        lines.push(Line::from(vec![label("dpi"), val(dpi.current.to_string()), THEME.dim(notes)]));
+        if !dpi.presets.is_empty() {
+            let levels: Vec<Span> = dpi
+                .presets
+                .iter()
+                .map(|&p| {
+                    let s = format!(" {p} ");
+                    if p == dpi.current { Span::styled(s, Style::new().fg(THEME.accent).bold()) } else { THEME.dim(s) }
+                })
+                .collect();
+            let mut row = vec![label("levels")];
+            row.extend(levels);
+            lines.push(Line::from(row));
+        }
     }
-    if let Some(hz) = d.report_rate {
-        lines.push(Line::from(vec![label("report rate"), val(format!("{hz} Hz"))]));
+    if let Some(rr) = &d.report_rate {
+        lines.push(Line::from(vec![label("report rate"), val(format!("{} Hz", rr.hz))]));
+    }
+    if let Some(m) = d.onboard_mode {
+        let txt = match m { 1 => "onboard — the mouse runs its stored profile", 2 => "host", _ => "?" };
+        lines.push(Line::from(vec![label("profiles"), val(txt.to_string())]));
     }
     if let Some(e) = &d.error {
         lines.push(Line::from(Span::styled(format!("  {e}"), Style::new().fg(THEME.err))));
@@ -203,18 +224,20 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 64, 14, "Help", THEME.accent);
+    let inner = modal_block(f, area, 64, 16, "Help", THEME.accent);
     let row = |k: &str, t: &str| Line::from(vec![THEME.key(format!("{k:>8}")), THEME.dim(format!("  {t}"))]);
     let lines = vec![
         row("↑↓", "select a device"),
+        row("d", "set DPI (type a value, ←→ step through onboard levels)"),
+        row("p", "set report rate (pick from what the mouse supports)"),
         row("r", "rescan receivers now (battery refreshes on its own)"),
         row("Shift+U", "check for / install an update"),
         row("c", "copy the session log to the clipboard"),
         row("q", "quit"),
         Line::from(""),
         Line::from(THEME.dim("  Talks Logitech HID++ to Unifying / Lightspeed / Bolt receivers.")),
-        Line::from(THEME.dim("  Everything is read-only in this version: name, battery, DPI,")),
-        Line::from(THEME.dim("  report rate. A paired mouse that is asleep shows as offline.")),
+        Line::from(THEME.dim("  DPI and report rate are written straight to the mouse and read")),
+        Line::from(THEME.dim("  back; every change is logged. A sleeping mouse shows as offline.")),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -245,4 +268,65 @@ fn draw_update(f: &mut Frame, area: Rect, app: &App, steps: &[String], done: Opt
         }
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_dpi(f: &mut Frame, area: Rect, app: &App, input: &str) {
+    let inner = modal_block(f, area, 60, 11, "Set DPI", THEME.accent);
+    let Some((_, d)) = app.selected() else { return };
+    let Some(dpi) = &d.dpi else { return };
+    let typed: Option<u16> = input.parse().ok();
+    let snapped = typed.map(|v| dpi.snap(v));
+    let name = d.name.clone().unwrap_or_else(|| d.paired_name.clone());
+    let mut lines = vec![
+        Line::from(vec![THEME.dim("  "), Span::styled(name, Style::new().fg(THEME.text).bold()), THEME.dim(format!("  now {} dpi", dpi.current))]),
+        Line::from(""),
+        Line::from(vec![
+            THEME.dim("  new dpi  "),
+            Span::styled(format!("{input}▏"), Style::new().fg(THEME.text).bold()),
+            match (typed, snapped) {
+                (Some(t), Some(s)) if s != t => Span::styled(format!("  → {s} (nearest supported)"), Style::new().fg(THEME.warn)),
+                (None, _) if !input.is_empty() => Span::styled("  not a number", Style::new().fg(THEME.err)),
+                _ => Span::raw(""),
+            },
+        ]),
+        Line::from(THEME.dim(format!("  range {}–{}", dpi.min(), dpi.max()))),
+    ];
+    if !dpi.presets.is_empty() {
+        let levels = dpi.presets.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("  ");
+        lines.push(Line::from(THEME.dim(format!("  onboard levels  {levels}   (←→ to step)"))));
+    }
+    if d.onboard_mode == Some(1) {
+        lines.push(Line::from(Span::styled("  onboard profile active — the mouse may revert on its own", Style::new().fg(THEME.warn))));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![THEME.key("  Enter"), THEME.dim(" apply   "), THEME.key("Esc"), THEME.dim(" cancel")]));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_rate(f: &mut Frame, area: Rect, app: &App, sel: usize) {
+    let inner = modal_block(f, area, 60, 9, "Set report rate", THEME.accent);
+    let Some((_, d)) = app.selected() else { return };
+    let Some(rr) = &d.report_rate else { return };
+    let name = d.name.clone().unwrap_or_else(|| d.paired_name.clone());
+    let mut row = vec![THEME.dim("  ")];
+    for (i, hz) in rr.supported.iter().enumerate() {
+        let s = format!(" {hz} ");
+        row.push(if i == sel {
+            Span::styled(s, Style::new().fg(THEME.text).bg(THEME.sel_bg).bold())
+        } else if *hz == rr.hz {
+            Span::styled(s, Style::new().fg(THEME.accent))
+        } else {
+            THEME.dim(s)
+        });
+        row.push(Span::raw(" "));
+    }
+    let lines = vec![
+        Line::from(vec![THEME.dim("  "), Span::styled(name, Style::new().fg(THEME.text).bold()), THEME.dim(format!("  now {} Hz", rr.hz))]),
+        Line::from(""),
+        Line::from(row),
+        Line::from(""),
+        Line::from(THEME.dim("  Higher rates cost battery; applies to the active link.")),
+        Line::from(vec![THEME.key("  Enter"), THEME.dim(" apply   "), THEME.key("←→"), THEME.dim(" choose   "), THEME.key("Esc"), THEME.dim(" cancel")]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }

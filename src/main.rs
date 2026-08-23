@@ -25,6 +25,14 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--list" || a == "-l") {
         return list();
     }
+    if let Some(pos) = std::env::args().position(|a| a == "--call") {
+        return call(std::env::args().skip(pos + 1).collect());
+    }
+    if let Some(pos) = std::env::args().position(|a| a == "--set-dpi" || a == "--set-rate") {
+        let args: Vec<String> = std::env::args().collect();
+        let value: u16 = args.get(pos + 1).and_then(|v| v.parse().ok()).ok_or_else(|| anyhow::anyhow!("usage: {} <value>", args[pos]))?;
+        return set(args[pos] == "--set-dpi", value);
+    }
 
     let cfg: app::Config = utility_core::config::load();
 
@@ -65,16 +73,61 @@ fn list() -> anyhow::Result<()> {
                 println!("         battery: {:?} {:?} {:?}", b.percent, b.millivolts, b.status);
             }
             if let Some(dpi) = d.dpi {
-                let default = if dpi.default > 0 { format!("default {}, ", dpi.default) } else { String::new() };
-                println!("         dpi: {} ({default}{}-{} step {})", dpi.current, dpi.min, dpi.max, dpi.step);
+                let default = if dpi.default > 0 { format!(", default {}", dpi.default) } else { String::new() };
+                let segs: Vec<String> = dpi.segments.iter().map(|s| format!("{}-{}/{}", s.from, s.to, s.step)).collect();
+                println!("         dpi: {} ({}-{}{default})  ranges {}", dpi.current, dpi.min(), dpi.max(), segs.join(" "));
+                if !dpi.presets.is_empty() {
+                    println!("         dpi levels: {:?}  lod {}", dpi.presets, dpi.lod);
+                }
             }
-            if let Some(hz) = d.report_rate {
-                println!("         report rate: {hz} Hz");
+            if let Some(rr) = &d.report_rate {
+                println!("         report rate: {} Hz  (supported {:?})", rr.hz, rr.supported);
+            }
+            if let Some(m) = d.onboard_mode {
+                println!("         onboard profiles: {}", match m { 1 => "onboard", 2 => "host", _ => "?" });
             }
             if let Some(e) = &d.error {
                 println!("         error: {e}");
             }
         }
     }
+    Ok(())
+}
+
+/// `--set-dpi <dpi>` / `--set-rate <hz>` on the first online mouse.
+fn set(dpi: bool, value: u16) -> anyhow::Result<()> {
+    let (r, mut d) = first_online()?;
+    let msg = if dpi {
+        let cur = d.dpi.clone().ok_or_else(|| anyhow::anyhow!("device does not expose DPI"))?;
+        app::apply_dpi(&r, &mut d, &cur, cur.snap(value)).map_err(|e| anyhow::anyhow!(e))?
+    } else {
+        app::apply_rate(&r, &mut d, value).map_err(|e| anyhow::anyhow!(e))?
+    };
+    println!("{msg}");
+    Ok(())
+}
+
+/// The first receiver with an online device, and that device.
+fn first_online() -> anyhow::Result<(hidpp::Receiver, hidpp::Device)> {
+    for r in hidpp::receivers().map_err(|e| anyhow::anyhow!(e))? {
+        if let Some(d) = r.devices().into_iter().find(|d| d.online) {
+            return Ok((r, d));
+        }
+    }
+    anyhow::bail!("no online device")
+}
+
+/// `mouseutility --call <feature-hex> <fn> [param hex bytes…]` — raw HID++ 2.0
+/// call to the first online device, for development. Prints the 16 reply bytes.
+fn call(args: Vec<String>) -> anyhow::Result<()> {
+    let feature = u16::from_str_radix(args.first().map(|s| s.trim_start_matches("0x")).unwrap_or(""), 16)
+        .map_err(|_| anyhow::anyhow!("usage: --call <feature-hex> <fn> [hex bytes…]"))?;
+    let func: u8 = args.get(1).and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("missing fn"))?;
+    let params: Vec<u8> = args[2..].iter().map(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16)).collect::<Result<_, _>>()?;
+    let (r, d) = first_online()?;
+    let f = r.link.feature_index(d.index, feature)?;
+    let reply = r.link.call(d.index, f, func, &params)?;
+    println!("slot {} feature {feature:#06x} at index {f:#04x} fn {func}:", d.index);
+    println!("  {}", reply.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
     Ok(())
 }
