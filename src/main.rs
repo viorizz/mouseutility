@@ -5,7 +5,7 @@ mod app;
 mod hidpp;
 mod ui;
 
-use utility_core::{cli, AppInfo};
+use utility_core::{cli, shell, AppInfo};
 
 pub static APP: AppInfo = AppInfo {
     name: "mouseutility",
@@ -38,21 +38,13 @@ fn main() -> anyhow::Result<()> {
 
     if std::env::args().any(|a| a == "--snapshot") {
         let mut app = app::App::new(cfg);
-        print!("{}", app.snapshot(110, 30, std::time::Duration::from_secs(8))?);
+        print!("{}", shell::snapshot(&mut app, 110, 30, std::time::Duration::from_secs(8))?);
         return Ok(());
     }
     cli::auto_update_on_launch(&APP, cfg.core.auto_update);
 
-    let mut terminal = ratatui::init();
-    let _ = utility_core::ui::set_terminal_title(&APP);
     let mut app = app::App::new(cfg);
-    let result = app.run(&mut terminal);
-    ratatui::restore();
-    if app.restart_requested {
-        println!("{}: restarting into the new version…", APP.name);
-        std::process::exit(utility_core::update::relaunch().map_err(|e| anyhow::anyhow!(e))?);
-    }
-    result
+    std::process::exit(shell::launch(&mut app)?);
 }
 
 /// `mouseutility --list` — print receivers and paired devices, then exit.

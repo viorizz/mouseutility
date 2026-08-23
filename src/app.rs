@@ -2,11 +2,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::Frame;
 use serde::{Deserialize, Serialize};
 use utility_core::config::CoreSettings;
-use utility_core::{logger, update};
+use utility_core::logger;
+use utility_core::shell::{self, Product, Shell};
+use utility_core::ui::Hint;
 
 use crate::hidpp::{self, Device, Dpi, Receiver as HidReceiver};
 use crate::ui;
@@ -48,18 +50,14 @@ pub struct ReceiverInfo {
 }
 
 pub enum AppEvent {
-    LatestRelease(Option<String>),
-    Progress(String),
-    Finished(Result<String, String>),
     Scanned(Result<Vec<ReceiverInfo>, String>),
     /// A write finished; the string describes what changed.
     Applied(Result<String, String>),
 }
 
+/// The product's own modals; Help and Update live in the shell.
 pub enum Modal {
     None,
-    Help,
-    Update { steps: Vec<String>, done: Option<Result<String, String>> },
     /// Type a DPI; `←`/`→` step through onboard levels. Enter applies the snapped value.
     Dpi { input: String },
     /// Pick a report rate from the supported list.
@@ -67,12 +65,9 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub shell: Shell,
     pub cfg: Config,
     pub modal: Modal,
-    pub update: Option<String>,
-    pub status: Option<(String, bool, Instant)>,
-    pub tick: usize,
-    pub restart_requested: bool,
     pub receivers: Vec<ReceiverInfo>,
     pub scan_error: Option<String>,
     /// Selected entry in the flattened device list.
@@ -85,21 +80,22 @@ pub struct App {
     /// Devices already warned about low battery this session.
     low_warned: HashSet<String>,
     pub last_scan: Option<Instant>,
-    quit: bool,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
 }
 
 impl App {
     pub fn new(cfg: Config) -> Self {
+        Self::with_shell(Shell::new(&crate::APP, ui::THEME), cfg)
+    }
+
+    /// `new` with an explicit shell (tests use [`Shell::offline`]).
+    pub fn with_shell(shell: Shell, cfg: Config) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut app = App {
+            shell,
             cfg,
             modal: Modal::None,
-            update: None,
-            status: None,
-            tick: 0,
-            restart_requested: false,
             receivers: Vec::new(),
             scan_error: None,
             sel: 0,
@@ -108,17 +104,9 @@ impl App {
             history: HashMap::new(),
             low_warned: HashSet::new(),
             last_scan: None,
-            quit: false,
             tx,
             rx,
         };
-        if !utility_core::cli::update_check_opted_out(&crate::APP) {
-            let tx = app.tx.clone();
-            std::thread::spawn(move || {
-                let tag = update::check_latest().ok().flatten().map(|(t, _)| t);
-                let _ = tx.send(AppEvent::LatestRelease(tag));
-            });
-        }
         app.rescan();
         app
     }
@@ -130,58 +118,6 @@ impl App {
 
     pub fn selected(&self) -> Option<(usize, &Device)> {
         self.devices().get(self.sel).copied()
-    }
-
-    /// Render one frame to an in-memory backend after the first scan (`--snapshot`).
-    pub fn snapshot(&mut self, width: u16, height: u16, timeout: Duration) -> anyhow::Result<String> {
-        let deadline = Instant::now() + timeout;
-        while self.scanning && Instant::now() < deadline {
-            if let Ok(ev) = self.rx.recv_timeout(Duration::from_millis(50)) {
-                self.on_event(ev);
-            }
-        }
-        let backend = ratatui::backend::TestBackend::new(width, height);
-        let mut terminal = ratatui::Terminal::new(backend)?;
-        terminal.draw(|f| ui::draw(f, self))?;
-        let buf = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..height {
-            let line: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
-            out.push_str(line.trim_end());
-            out.push('\n');
-        }
-        Ok(out)
-    }
-
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
-        while !self.quit {
-            terminal.draw(|f| ui::draw(f, self))?;
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
-                        self.on_key(k);
-                    }
-                }
-            }
-            while let Ok(ev) = self.rx.try_recv() {
-                self.on_event(ev);
-            }
-            self.tick = self.tick.wrapping_add(1);
-            if self.status.as_ref().is_some_and(|(_, _, t)| t.elapsed() > Duration::from_secs(5)) {
-                self.status = None;
-            }
-            // Live refresh: battery / online state every few seconds.
-            if !self.scanning && self.last_scan.is_some_and(|t| t.elapsed() > Duration::from_secs(4)) {
-                self.rescan();
-            }
-        }
-        Ok(())
-    }
-
-    pub fn set_status(&mut self, msg: impl Into<String>, is_err: bool) {
-        let msg = msg.into();
-        logger::log(format!("status: {msg}"));
-        self.status = Some((msg, is_err, Instant::now()));
     }
 
     fn rescan(&mut self) {
@@ -202,22 +138,11 @@ impl App {
 
     fn on_event(&mut self, ev: AppEvent) {
         match ev {
-            AppEvent::LatestRelease(tag) => self.update = tag,
-            AppEvent::Progress(s) => {
-                if let Modal::Update { steps, .. } = &mut self.modal {
-                    steps.push(s);
-                }
-            }
-            AppEvent::Finished(r) => {
-                if let Modal::Update { done, .. } = &mut self.modal {
-                    *done = Some(r);
-                }
-            }
             AppEvent::Applied(r) => {
                 self.applying = false;
                 match r {
-                    Ok(msg) => self.set_status(msg, false),
-                    Err(e) => self.set_status(e, true),
+                    Ok(msg) => self.shell.set_status(msg, false),
+                    Err(e) => self.shell.set_status(e, true),
                 }
                 self.rescan();
             }
@@ -245,77 +170,57 @@ impl App {
         }
     }
 
-    fn on_key(&mut self, k: KeyEvent) {
+    /// Keys while no shell modal is open; `true` when consumed.
+    fn product_key(&mut self, k: KeyEvent) -> bool {
         // The input modals need both the selection and the modal state, so
         // take them out of `self` first.
         match std::mem::replace(&mut self.modal, Modal::None) {
-            Modal::Dpi { input } => return self.on_key_dpi(k, input),
-            Modal::Rate { sel } => return self.on_key_rate(k, sel),
-            other => self.modal = other,
+            Modal::Dpi { input } => {
+                self.on_key_dpi(k, input);
+                return true;
+            }
+            Modal::Rate { sel } => {
+                self.on_key_rate(k, sel);
+                return true;
+            }
+            Modal::None => {}
         }
-        match &mut self.modal {
-            Modal::Help => self.modal = Modal::None,
-            Modal::Dpi { .. } | Modal::Rate { .. } => unreachable!(),
-            Modal::Update { done, .. } => match (k.code, done.as_ref()) {
-                (KeyCode::Char('a'), Some(Ok(_))) => {
-                    self.cfg.core.auto_update = !self.cfg.core.auto_update;
-                    if let Err(e) = utility_core::config::save(&self.cfg) {
-                        self.set_status(e, true);
-                    }
-                }
-                (KeyCode::Enter, Some(Ok(msg))) if update::updated(msg) => {
-                    self.restart_requested = true;
-                    self.quit = true;
-                }
-                (KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'), Some(_)) => self.modal = Modal::None,
-                _ => {}
-            },
-            Modal::None => {
-                let n = self.devices().len();
-                match (k.code, k.modifiers) {
-                    (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.quit = true,
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.quit = true,
-                    (KeyCode::Char('?'), _) => self.modal = Modal::Help,
-                    (KeyCode::Char('U'), _) => self.start_update(),
-                    (KeyCode::Char('c'), _) => match logger::copy_to_clipboard() {
-                        Ok(n) => self.set_status(format!("copied {n} log lines to the clipboard"), false),
-                        Err(e) => self.set_status(e, true),
-                    },
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                        if n > 0 {
-                            self.sel = (self.sel + n - 1) % n;
-                        }
-                    }
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                        if n > 0 {
-                            self.sel = (self.sel + 1) % n;
-                        }
-                    }
-                    (KeyCode::Char('r'), _) => {
-                        self.rescan();
-                        self.set_status("rescanning…", false);
-                    }
-                    (KeyCode::Char('d'), _) => match self.selected() {
-                        Some((_, d)) if d.online && d.dpi.is_some() => {
-                            let cur = d.dpi.as_ref().map(|x| x.current).unwrap_or(0);
-                            self.modal = Modal::Dpi { input: cur.to_string() };
-                        }
-                        Some((_, d)) if !d.online => self.set_status("device is offline — move the mouse to wake it", true),
-                        _ => self.set_status("this device does not expose an adjustable DPI", true),
-                    },
-                    (KeyCode::Char('p'), _) => match self.selected() {
-                        Some((_, d)) if d.online && d.report_rate.as_ref().is_some_and(|r| !r.supported.is_empty()) => {
-                            let rr = d.report_rate.as_ref().unwrap();
-                            let sel = rr.supported.iter().position(|&h| h == rr.hz).unwrap_or(0);
-                            self.modal = Modal::Rate { sel };
-                        }
-                        Some((_, d)) if !d.online => self.set_status("device is offline — move the mouse to wake it", true),
-                        _ => self.set_status("this device does not expose an adjustable report rate", true),
-                    },
-                    _ => {}
+        let n = self.devices().len();
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if n > 0 {
+                    self.sel = (self.sel + n - 1) % n;
                 }
             }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if n > 0 {
+                    self.sel = (self.sel + 1) % n;
+                }
+            }
+            KeyCode::Char('r') => {
+                self.rescan();
+                self.shell.set_status("rescanning…", false);
+            }
+            KeyCode::Char('d') => match self.selected() {
+                Some((_, d)) if d.online && d.dpi.is_some() => {
+                    let cur = d.dpi.as_ref().map(|x| x.current).unwrap_or(0);
+                    self.modal = Modal::Dpi { input: cur.to_string() };
+                }
+                Some((_, d)) if !d.online => self.shell.set_status("device is offline — move the mouse to wake it", true),
+                _ => self.shell.set_status("this device does not expose an adjustable DPI", true),
+            },
+            KeyCode::Char('p') => match self.selected() {
+                Some((_, d)) if d.online && d.report_rate.as_ref().is_some_and(|r| !r.supported.is_empty()) => {
+                    let rr = d.report_rate.as_ref().unwrap();
+                    let sel = rr.supported.iter().position(|&h| h == rr.hz).unwrap_or(0);
+                    self.modal = Modal::Rate { sel };
+                }
+                Some((_, d)) if !d.online => self.shell.set_status("device is offline — move the mouse to wake it", true),
+                _ => self.shell.set_status("this device does not expose an adjustable report rate", true),
+            },
+            _ => return false,
         }
+        true
     }
 
     fn on_key_dpi(&mut self, k: KeyEvent, mut input: String) {
@@ -323,9 +228,10 @@ impl App {
         let dpi = sel.as_ref().and_then(|(_, d)| d.dpi.clone());
         match k.code {
             KeyCode::Esc => return,
-            KeyCode::Char(c) if c.is_ascii_digit() && input.len() < 5 => input.push(c),
-            KeyCode::Backspace => {
-                input.pop();
+            KeyCode::Char(c) if !c.is_ascii_digit() => {}
+            KeyCode::Char(_) if input.len() >= 5 => {}
+            KeyCode::Char(_) | KeyCode::Backspace => {
+                shell::edit_key(&mut input, &k);
             }
             KeyCode::Left | KeyCode::Right => {
                 if let Some(dpi) = &dpi {
@@ -344,7 +250,7 @@ impl App {
                 if let (Ok(v), Some(dpi), Some((pid, d))) = (input.parse::<u16>(), dpi, sel) {
                     let v = dpi.snap(v);
                     if v == dpi.current {
-                        self.set_status(format!("DPI is already {v}"), false);
+                        self.shell.set_status(format!("DPI is already {v}"), false);
                         return;
                     }
                     self.start_write(
@@ -372,7 +278,7 @@ impl App {
             KeyCode::Enter => {
                 if let (Some(&hz), Some((pid, d))) = (rates.get(sel), target) {
                     if d.report_rate.as_ref().is_some_and(|r| r.hz == hz) {
-                        self.set_status(format!("report rate is already {hz} Hz"), false);
+                        self.shell.set_status(format!("report rate is already {hz} Hz"), false);
                         return;
                     }
                     self.start_write(
@@ -417,7 +323,7 @@ impl App {
             }
         }
         for msg in toasts {
-            self.set_status(format!("low battery: {msg}"), true);
+            self.shell.set_status(format!("low battery: {msg}"), true);
             if notify {
                 std::thread::spawn(move || utility_core::notify::toast("Low battery", &msg));
             }
@@ -427,7 +333,7 @@ impl App {
     /// Run a write against the receiver `pid` on a worker thread.
     fn start_write(&mut self, job: impl FnOnce(&HidReceiver) -> Result<String, String> + Send + 'static, pid: u16) {
         if self.applying {
-            self.set_status("a change is still being applied", true);
+            self.shell.set_status("a change is still being applied", true);
             return;
         }
         self.applying = true;
@@ -437,16 +343,50 @@ impl App {
             let _ = tx.send(AppEvent::Applied(r));
         });
     }
+}
 
-    fn start_update(&mut self) {
-        self.modal = Modal::Update { steps: Vec::new(), done: None };
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let r = update::self_update_with(&|s| {
-                let _ = tx.send(AppEvent::Progress(s.to_string()));
-            });
-            let _ = tx.send(AppEvent::Finished(r));
-        });
+impl Product for App {
+    fn shell(&self) -> &Shell {
+        &self.shell
+    }
+    fn shell_mut(&mut self) -> &mut Shell {
+        &mut self.shell
+    }
+    fn core_settings(&self) -> &CoreSettings {
+        &self.cfg.core
+    }
+    fn core_settings_mut(&mut self) -> &mut CoreSettings {
+        &mut self.cfg.core
+    }
+    fn save_config(&self) -> Result<(), String> {
+        utility_core::config::save(&self.cfg)
+    }
+    fn hints(&self) -> &[Hint] {
+        ui::HINTS
+    }
+    fn help(&self) -> shell::Help {
+        shell::Help::from_hints(ui::HINTS)
+            .width(66)
+            .note("Talks Logitech HID++ to Unifying / Lightspeed / Bolt receivers.")
+            .note("DPI and report rate are written straight to the mouse and read back; every change is logged. A sleeping mouse shows as offline.")
+    }
+    fn loading(&self) -> bool {
+        self.scanning && self.last_scan.is_none()
+    }
+    fn draw(&self, f: &mut Frame) {
+        ui::draw(f, self);
+    }
+    fn on_tick(&mut self) {
+        while let Ok(ev) = self.rx.try_recv() {
+            self.on_event(ev);
+        }
+        // Live refresh: battery / online state every few seconds.
+        if !self.scanning && self.last_scan.is_some_and(|t| t.elapsed() > Duration::from_secs(4)) {
+            self.rescan();
+        }
+    }
+    fn on_key(&mut self, k: KeyEvent) -> bool {
+        self.product_key(k)
     }
 }
 
@@ -480,4 +420,85 @@ pub fn apply_rate(r: &HidReceiver, d: &mut Device, hz: u16) -> Result<String, St
     }
     d.report_rate = Some(now);
     Ok(format!("report rate {old} → {hz} Hz"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyModifiers;
+
+    fn app() -> App {
+        utility_core::register(&crate::APP);
+        let mut a = App::with_shell(Shell::offline(&crate::APP, ui::THEME), Config::default());
+        // Pretend the first scan finished with one online mouse.
+        let mut d = Device {
+            index: 1,
+            paired_name: "TEST MOUSE".into(),
+            wpid: 0x40bd,
+            kind: "mouse",
+            online: true,
+            protocol: Some((4, 2)),
+            name: Some("TEST MOUSE".into()),
+            battery: Some(hidpp::Battery { percent: Some(15), millivolts: None, status: hidpp::ChargeState::Discharging }),
+            dpi: Some(Dpi { current: 1600, default: 800, presets: vec![800, 1600, 3200], ..Default::default() }),
+            report_rate: Some(hidpp::ReportRate { hz: 1000, supported: vec![500, 1000] }),
+            onboard_mode: Some(2),
+            error: None,
+        };
+        d.dpi.as_mut().unwrap().segments = vec![hidpp::DpiSegment { from: 100, to: 3200, step: 50 }];
+        a.cfg.core.notify = false;
+        a.on_event(AppEvent::Scanned(Ok(vec![ReceiverInfo { pid: 0xc54d, kind: "Lightspeed receiver", devices: vec![d] }])));
+        a.scanning = false;
+        a
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn frame_renders_device() {
+        let mut a = app();
+        let out = shell::snapshot(&mut a, 110, 30, Duration::ZERO).unwrap();
+        assert!(out.contains("TEST MOUSE"), "{out}");
+        assert!(out.contains("1600"), "{out}");
+        assert!(out.contains("report rate  1000 Hz"), "{out}");
+    }
+
+    #[test]
+    fn low_battery_warns_once() {
+        let a = app();
+        assert!(a.shell.status_ref().is_some_and(|(m, e)| e && m.contains("15%")));
+        assert_eq!(a.history["c54d/1"].len(), 1);
+        let mut a = a;
+        a.shell.clear_status();
+        let rs = a.receivers.clone();
+        a.on_event(AppEvent::Scanned(Ok(rs)));
+        assert!(a.shell.status_ref().is_none(), "second scan must not warn again");
+        assert_eq!(a.history["c54d/1"].len(), 2);
+    }
+
+    #[test]
+    fn dpi_modal_keeps_q_and_snaps() {
+        let mut a = app();
+        shell::handle_key(&mut a, key('d'));
+        assert!(matches!(a.modal, Modal::Dpi { .. }));
+        shell::handle_key(&mut a, key('q'));
+        assert!(!a.shell.quit, "q inside the DPI input is just ignored");
+        shell::handle_key(&mut a, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(&a.modal, Modal::Dpi { input } if input == "3200"), "→ steps to the next onboard level");
+        shell::handle_key(&mut a, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(a.modal, Modal::None) && !a.shell.quit);
+        shell::handle_key(&mut a, key('q'));
+        assert!(a.shell.quit);
+    }
+
+    #[test]
+    fn rate_modal_starts_on_current() {
+        let mut a = app();
+        shell::handle_key(&mut a, key('p'));
+        assert!(matches!(a.modal, Modal::Rate { sel: 1 }));
+        let out = shell::snapshot(&mut a, 110, 30, Duration::ZERO).unwrap();
+        assert!(out.contains("Set report rate"), "{out}");
+    }
 }

@@ -8,7 +8,12 @@ extracts it as the GitHub release notes and fails without one.
 ### Added
 - **Low-battery toast**: when a mouse drops to `low_battery_percent` (config, default 20; 0 disables) while discharging, a Windows toast fires once per session per device (re-armed once it charges back above the threshold) and the status line turns red. Honours the shared `notify` setting.
 - **Battery history sparkline** in the details panel, built from the 4 s polls (last ~16 min), with min–max and the toast threshold as a caption.
+- Shell-driven tests: the DPI / report-rate modals and the low-battery warning are exercised through the full key stack with an offline shell and rendered frames.
 - **Direct-connected devices**: Logitech devices plugged in over USB (vendor page `0xFF00` on a non-receiver product id) or paired over Bluetooth (`0xFF43`, long reports only) are enumerated beside receivers and probed at device index `0xFF`, with the kind from `0x0005` getDeviceType. Read-only and untested on real hardware so far — no such device was available; please report what you see.
+
+### Changed
+- Built on **utility-core v0.2.0**: the app loop, update dialog, help overlay, status line and snapshot renderer now come from `utility_core::shell`; MouseUtility only carries its panels, keys and its own modals.
+- CI / Release workflows use SHA-pinned actions; `packaging/release.ps1` cuts a release after checking CHANGELOG, Cargo.toml and the tree.
 
 ## v0.2.0
 

@@ -3,15 +3,15 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
-use utility_core::ui::{draw_footer, draw_header, modal_block, spinner, HeaderStatus, Hint, Theme};
+use utility_core::shell::Shell;
+use utility_core::ui::{modal_block, Hint, Theme};
 
 use crate::app::{App, Modal};
 use crate::hidpp::{ChargeState, Device};
-use crate::APP;
 
 pub const THEME: Theme = Theme::MOUSE;
 
-const HINTS: &[Hint] = &[("↑↓", "select"), ("d", "dpi"), ("p", "rate"), ("r", "rescan"), ("U", "update"), ("c", "log"), ("?", "help"), ("q", "quit")];
+pub const HINTS: &[Hint] = &[("↑↓", "select"), ("d", "dpi"), ("p", "rate"), ("r", "rescan"), ("U", "update"), ("c", "log"), ("?", "help"), ("q", "quit")];
 
 /// A small mouse, top view.
 const MOUSE_ART: [&str; 9] = [
@@ -28,21 +28,20 @@ const MOUSE_ART: [&str; 9] = [
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
-    let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(6), Constraint::Length(1)]).split(area);
+    let [head, body, foot] = Shell::layout(area);
 
-    let status = HeaderStatus { update_available: app.update.clone(), ..Default::default() };
-    draw_header(f, rows[0], &THEME, &APP, &status);
+    let mut status = app.shell.header_status();
+    status.show_elevation = false;
+    app.shell.draw_header(f, head, &status);
 
-    let cols = Layout::horizontal([Constraint::Length(40), Constraint::Min(30)]).split(rows[1]);
+    let cols = Layout::horizontal([Constraint::Length(40), Constraint::Min(30)]).split(body);
     draw_devices(f, cols[0], app);
     draw_details(f, cols[1], app);
 
-    draw_footer(f, rows[2], &THEME, app.status.as_ref().map(|(m, e, _)| (m.as_str(), *e)), HINTS);
+    app.shell.draw_footer(f, foot, HINTS);
 
     match &app.modal {
         Modal::None => {}
-        Modal::Help => draw_help(f, area),
-        Modal::Update { steps, done } => draw_update(f, area, app, steps, done.as_ref()),
         Modal::Dpi { input } => draw_dpi(f, area, app, input),
         Modal::Rate { sel } => draw_rate(f, area, app, *sel),
     }
@@ -51,7 +50,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn draw_devices(f: &mut Frame, area: Rect, app: &App) {
     let mut title = vec![Span::styled(" Devices ", Style::new().fg(THEME.text).bold())];
     if app.scanning {
-        title.push(Span::styled(format!("{} ", spinner(app.tick)), Style::new().fg(THEME.accent)));
+        title.push(Span::styled(format!("{} ", app.shell.spinner()), Style::new().fg(THEME.accent)));
     }
     let block = THEME.bordered(Line::from(title));
     let inner = block.inner(area);
@@ -247,53 +246,6 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-}
-
-fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 64, 16, "Help", THEME.accent);
-    let row = |k: &str, t: &str| Line::from(vec![THEME.key(format!("{k:>8}")), THEME.dim(format!("  {t}"))]);
-    let lines = vec![
-        row("↑↓", "select a device"),
-        row("d", "set DPI (type a value, ←→ step through onboard levels)"),
-        row("p", "set report rate (pick from what the mouse supports)"),
-        row("r", "rescan receivers now (battery refreshes on its own)"),
-        row("Shift+U", "check for / install an update"),
-        row("c", "copy the session log to the clipboard"),
-        row("q", "quit"),
-        Line::from(""),
-        Line::from(THEME.dim("  Talks Logitech HID++ to Unifying / Lightspeed / Bolt receivers.")),
-        Line::from(THEME.dim("  DPI and report rate are written straight to the mouse and read")),
-        Line::from(THEME.dim("  back; every change is logged. A sleeping mouse shows as offline.")),
-    ];
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
-fn draw_update(f: &mut Frame, area: Rect, app: &App, steps: &[String], done: Option<&Result<String, String>>) {
-    let inner = modal_block(f, area, 70, 14, "Update", THEME.accent);
-    let mut lines: Vec<Line> = steps.iter().map(|s| Line::from(THEME.dim(format!("  {s}")))).collect();
-    match done {
-        None => lines.push(Line::from(vec![
-            Span::styled(format!("  {} ", spinner(app.tick)), Style::new().fg(THEME.accent)),
-            THEME.dim("working…"),
-        ])),
-        Some(Ok(msg)) => {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(format!("  {msg}"), Style::new().fg(THEME.ok))));
-            lines.push(Line::from(""));
-            let auto = if app.cfg.core.auto_update { "on" } else { "off" };
-            lines.push(Line::from(vec![THEME.key("  a"), THEME.dim(format!(" auto-update at launch: {auto}"))]));
-            if utility_core::update::updated(msg) {
-                lines.push(Line::from(vec![THEME.key("  Enter"), THEME.dim(" restart now")]));
-            }
-            lines.push(Line::from(vec![THEME.key("  Esc"), THEME.dim(" close")]));
-        }
-        Some(Err(e)) => {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(format!("  {e}"), Style::new().fg(THEME.err))));
-            lines.push(Line::from(vec![THEME.key("  Esc"), THEME.dim(" close")]));
-        }
-    }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_dpi(f: &mut Frame, area: Rect, app: &App, input: &str) {
