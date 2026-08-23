@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Re-submit an already published version to winget by hand (e.g. the run
+  # that published it had no WINGET_TOKEN yet). Only the winget job runs.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published tag to submit to winget, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  PRODUCT: mouseutility
+
+jobs:
+  release:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Prepare assets
+        shell: pwsh
+        run: |
+          Copy-Item "target/release/$env:PRODUCT.exe" "$env:PRODUCT.exe"
+          $hash = (Get-FileHash "$env:PRODUCT.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:PRODUCT.exe" | Out-File -Encoding ascii checksums.txt
+          Get-Content checksums.txt
+      - name: Extract patch notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $notes = ./packaging/changelog-section.ps1 -Version $version
+          if (-not $notes) {
+            Write-Error "CHANGELOG.md has no '## v$version' section — add patch notes before tagging."
+            exit 1
+          }
+          $notes | Out-File -Encoding utf8 RELEASE_NOTES.md
+          Get-Content RELEASE_NOTES.md
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
+          files: |
+            mouseutility.exe
+            checksums.txt
+
+  # Publishes the new version to winget once the package exists there. Needs
+  # a repo secret WINGET_TOKEN (GitHub PAT, `public_repo` scope) used by
+  # wingetcreate to fork winget-pkgs and open the PR. Skipped silently when
+  # the secret is not configured.
+  winget:
+    needs: release
+    runs-on: windows-latest
+    if: ${{ always() && !contains(github.ref_name, '-') && (needs.release.result == 'success' || github.event_name == 'workflow_dispatch') }}
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      WINGET_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Submit to winget
+        shell: pwsh
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            Write-Host "WINGET_TOKEN secret not set - skipping winget submission."
+            exit 0
+          }
+          ./packaging/winget/submit.ps1 -Version $env:WINGET_VERSION -Token $env:WINGET_TOKEN

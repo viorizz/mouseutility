@@ -1,0 +1,6 @@
+/target
+*.log
+*.log.1
+*.exe.old
+*.exe.new
+packaging/winget/manifests/
