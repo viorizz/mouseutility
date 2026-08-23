@@ -65,7 +65,8 @@ fn list() -> anyhow::Result<()> {
                 println!("         battery: {:?} {:?} {:?}", b.percent, b.millivolts, b.status);
             }
             if let Some(dpi) = d.dpi {
-                println!("         dpi: {} (default {}, {}-{} step {})", dpi.current, dpi.default, dpi.min, dpi.max, dpi.step);
+                let default = if dpi.default > 0 { format!("default {}, ", dpi.default) } else { String::new() };
+                println!("         dpi: {} ({default}{}-{} step {})", dpi.current, dpi.min, dpi.max, dpi.step);
             }
             if let Some(hz) = d.report_rate {
                 println!("         report rate: {hz} Hz");
