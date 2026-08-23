@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -10,10 +11,32 @@ use utility_core::{logger, update};
 use crate::hidpp::{self, Device, Dpi, Receiver as HidReceiver};
 use crate::ui;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(flatten)]
     pub core: CoreSettings,
+    /// Toast once per session when a mouse drops to this percentage while
+    /// discharging. 0 disables.
+    #[serde(default = "default_low_battery")]
+    pub low_battery_percent: u8,
+}
+
+fn default_low_battery() -> u8 {
+    20
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config { core: CoreSettings::default(), low_battery_percent: default_low_battery() }
+    }
+}
+
+/// Battery samples kept per device for the sparkline (one per 4 s poll).
+pub const HISTORY_LEN: usize = 240;
+
+/// Stable identity of a device across rescans: receiver pid + slot.
+pub fn device_key(pid: u16, d: &Device) -> String {
+    format!("{pid:04x}/{}", d.index)
 }
 
 /// Plain snapshot of one receiver and its paired devices (no handles).
@@ -57,6 +80,10 @@ pub struct App {
     pub scanning: bool,
     /// A write is in flight; refuse another until it finishes.
     pub applying: bool,
+    /// Battery percentage history per [`device_key`].
+    pub history: HashMap<String, VecDeque<u8>>,
+    /// Devices already warned about low battery this session.
+    low_warned: HashSet<String>,
     pub last_scan: Option<Instant>,
     quit: bool,
     tx: Sender<AppEvent>,
@@ -78,6 +105,8 @@ impl App {
             sel: 0,
             scanning: false,
             applying: false,
+            history: HashMap::new(),
+            low_warned: HashSet::new(),
             last_scan: None,
             quit: false,
             tx,
@@ -206,6 +235,7 @@ impl App {
                         }
                         self.receivers = rs;
                         self.scan_error = None;
+                        self.record_batteries();
                         let n = self.devices().len();
                         self.sel = self.sel.min(n.saturating_sub(1));
                     }
@@ -358,6 +388,40 @@ impl App {
             _ => {}
         }
         self.modal = Modal::Rate { sel };
+    }
+
+    /// Append this scan's battery readings to the history and raise the
+    /// low-battery toast the first time a device crosses the threshold.
+    fn record_batteries(&mut self) {
+        let threshold = self.cfg.low_battery_percent;
+        let notify = self.cfg.core.notify;
+        let mut toasts = Vec::new();
+        for r in &self.receivers {
+            for d in &r.devices {
+                let Some(b) = d.battery else { continue };
+                let Some(p) = b.percent else { continue };
+                let key = device_key(r.pid, d);
+                let h = self.history.entry(key.clone()).or_default();
+                h.push_back(p);
+                while h.len() > HISTORY_LEN {
+                    h.pop_front();
+                }
+                let low = threshold > 0 && p <= threshold && b.status == hidpp::ChargeState::Discharging;
+                if low && self.low_warned.insert(key.clone()) {
+                    let name = d.name.clone().unwrap_or_else(|| d.paired_name.clone());
+                    toasts.push(format!("{name} battery {p}%"));
+                } else if !low && p > threshold.saturating_add(5) {
+                    // Re-arm once it has clearly recovered (charged).
+                    self.low_warned.remove(&key);
+                }
+            }
+        }
+        for msg in toasts {
+            self.set_status(format!("low battery: {msg}"), true);
+            if notify {
+                std::thread::spawn(move || utility_core::notify::toast("Low battery", &msg));
+            }
+        }
     }
 
     /// Run a write against the receiver `pid` on a worker thread.

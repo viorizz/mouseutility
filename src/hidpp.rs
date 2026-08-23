@@ -8,7 +8,11 @@
 //! [`Link`] owns both and reads whichever answers.
 //!
 //! The receiver itself (device index 0xFF) speaks HID++ 1.0 registers; paired
-//! devices (index 1..=6) speak HID++ 2.0 features. A paired device that is
+//! devices (index 1..=6) speak HID++ 2.0 features. A device plugged in
+//! directly (USB cable, vendor page 0xFF00 on a non-receiver PID) or paired
+//! over Bluetooth (vendor page 0xFF43, long reports only) is addressed at
+//! index 0xFF itself and listed as its own "transport" entry — that path is
+//! untested here (no such device on the development machine) and read-only. A paired device that is
 //! asleep or switched off answers the ping with HID++ 1.0 error 0x08
 //! ("unknown device") — reported here as `online = false`, not as a failure.
 //!
@@ -135,6 +139,28 @@ impl Link {
             name.extend_from_slice(&r[..take]);
         }
         Ok(String::from_utf8_lossy(&name).trim_end_matches('\0').trim().to_string())
+    }
+
+    /// 0x0005 getDeviceType, for devices without a pairing-table entry.
+    pub fn device_type(&self, idx: u8) -> Result<&'static str> {
+        let f = self.feature_index(idx, 0x0005)?;
+        let r = self.call(idx, f, 2, &[])?;
+        Ok(match r[0] {
+            0 => "keyboard",
+            1 => "remote",
+            2 => "numpad",
+            3 => "mouse",
+            4 => "touchpad",
+            5 => "trackball",
+            6 => "gamepad",
+            7 => "joystick",
+            8 => "presenter",
+            9 => "receiver",
+            10 => "headset",
+            11 => "webcam",
+            12 => "steering wheel",
+            _ => "device",
+        })
     }
 
     pub fn battery(&self, idx: u8) -> Result<Battery> {
@@ -388,26 +414,73 @@ pub struct Device {
     pub error: Option<String>,
 }
 
+/// How a [`Receiver`] entry is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// A Unifying / Lightspeed / Bolt receiver with a pairing table.
+    Receiver,
+    /// A device plugged in over USB, talking HID++ itself.
+    Usb,
+    /// A device paired over Bluetooth (vendor page 0xFF43).
+    Bluetooth,
+}
+
+/// Direct-device index: the device itself rather than a pairing slot.
+pub const DIRECT_INDEX: u8 = 0xff;
+
 pub struct Receiver {
     pub pid: u16,
     pub product: String,
+    pub transport: Transport,
     pub link: Link,
+}
+
+/// Receiver product ids; anything else on the vendor page is a device.
+fn receiver_kind(pid: u16) -> Option<&'static str> {
+    Some(match pid {
+        0xc52b | 0xc532 | 0xc517 | 0xc51b | 0xc526 | 0xc52e | 0xc531 | 0xc542 => "Unifying receiver",
+        0xc52f | 0xc534 | 0xc53d => "Nano receiver",
+        0xc539 | 0xc53a | 0xc53f | 0xc547 | 0xc54d | 0xc541 | 0xc545 => "Lightspeed receiver",
+        0xc548 => "Bolt receiver",
+        _ => return None,
+    })
 }
 
 impl Receiver {
     pub fn kind(&self) -> &'static str {
-        match self.pid {
-            0xc52b | 0xc532 => "Unifying receiver",
-            0xc52f | 0xc534 => "Nano receiver",
-            0xc539 | 0xc53a | 0xc53f | 0xc547 | 0xc54d | 0xc541 | 0xc545 => "Lightspeed receiver",
-            0xc548 => "Bolt receiver",
-            _ => "receiver",
+        match self.transport {
+            Transport::Receiver => receiver_kind(self.pid).unwrap_or("receiver"),
+            Transport::Usb => "USB",
+            Transport::Bluetooth => "Bluetooth",
         }
     }
 
-    /// Read the pairing table (HID++ 1.0 register 0xB5) and probe each slot.
+    /// Read the pairing table (HID++ 1.0 register 0xB5) and probe each slot;
+    /// for a direct device, probe the device itself.
     pub fn devices(&self) -> Vec<Device> {
         let mut out = Vec::new();
+        if self.transport != Transport::Receiver {
+            let mut d = Device {
+                index: DIRECT_INDEX,
+                paired_name: self.product.clone(),
+                wpid: self.pid,
+                kind: "device",
+                online: false,
+                protocol: None,
+                name: None,
+                battery: None,
+                dpi: None,
+                report_rate: None,
+                onboard_mode: None,
+                error: None,
+            };
+            self.probe(&mut d);
+            if d.online {
+                d.kind = self.link.device_type(DIRECT_INDEX).unwrap_or("device");
+            }
+            out.push(d);
+            return out;
+        }
         for n in 0..6u8 {
             let Ok(info) = self.link.register(0x83, 0xb5, &[0x20 | n]) else { continue };
             if info.len() < 12 {
@@ -483,18 +556,24 @@ impl Receiver {
     }
 }
 
-/// (interface path, pid, product, short collection, long collection)
-type Group = (String, u16, String, Option<HidDevice>, Option<HidDevice>);
+/// (interface path, pid, product, transport, short collection, long collection)
+type Group = (String, u16, String, Transport, Option<HidDevice>, Option<HidDevice>);
 
-/// Open every Logitech receiver found (both vendor collections).
+/// Open every Logitech receiver and directly attached HID++ device found.
 pub fn receivers() -> std::result::Result<Vec<Receiver>, String> {
     let api = HidApi::new().map_err(|e| e.to_string())?;
-    // Group the 0xFF00 collections by USB interface path (everything before `&Col`).
+    // Group the vendor collections by interface path (everything before `&Col`).
     let mut groups: Vec<Group> = Vec::new();
     for info in api.device_list() {
-        if info.vendor_id() != LOGITECH || info.usage_page() != 0xff00 {
+        if info.vendor_id() != LOGITECH {
             continue;
         }
+        let transport = match info.usage_page() {
+            0xff00 if receiver_kind(info.product_id()).is_some() => Transport::Receiver,
+            0xff00 => Transport::Usb,
+            0xff43 => Transport::Bluetooth,
+            _ => continue,
+        };
         let path = info.path().to_string_lossy().into_owned();
         let base = path.split("&Col").next().unwrap_or(&path).to_ascii_lowercase();
         let dev = match info.open_device(&api) {
@@ -507,18 +586,20 @@ pub fn receivers() -> std::result::Result<Vec<Receiver>, String> {
         let entry = match groups.iter_mut().find(|g| g.0 == base) {
             Some(g) => g,
             None => {
-                groups.push((base.clone(), info.product_id(), info.product_string().unwrap_or("").to_string(), None, None));
+                groups.push((base.clone(), info.product_id(), info.product_string().unwrap_or("").to_string(), transport, None, None));
                 groups.last_mut().unwrap()
             }
         };
-        match info.usage() {
-            1 => entry.3 = Some(dev),
-            _ => entry.4 = Some(dev),
+        // Bluetooth carries long reports only (usage 0x0202 on page 0xFF43).
+        match (transport, info.usage()) {
+            (Transport::Bluetooth, _) => entry.5 = Some(dev),
+            (_, 1) => entry.4 = Some(dev),
+            _ => entry.5 = Some(dev),
         }
     }
     Ok(groups
         .into_iter()
-        .map(|(_, pid, product, short, long)| Receiver { pid, product, link: Link { short, long } })
+        .map(|(_, pid, product, transport, short, long)| Receiver { pid, product, transport, link: Link { short, long } })
         .collect())
 }
 
@@ -577,7 +658,9 @@ mod tests {
 
     #[test]
     fn receiver_kinds() {
-        let r = Receiver { pid: 0xc54d, product: String::new(), link: Link { short: None, long: None } };
+        let r = Receiver { pid: 0xc54d, product: String::new(), transport: Transport::Receiver, link: Link { short: None, long: None } };
         assert_eq!(r.kind(), "Lightspeed receiver");
+        assert!(receiver_kind(0xc548).is_some());
+        assert!(receiver_kind(0xc09d).is_none(), "a G PRO mouse pid is a device, not a receiver");
     }
 }

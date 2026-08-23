@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 use utility_core::ui::{draw_footer, draw_header, modal_block, spinner, HeaderStatus, Hint, Theme};
 
@@ -152,7 +152,14 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
             },
         ]),
         Line::from(""),
-        Line::from(vec![label("receiver"), val(format!("{} ({:04x}) · slot {}", r.kind, r.pid, d.index))]),
+        Line::from(vec![
+            label(if d.index == crate::hidpp::DIRECT_INDEX { "link" } else { "receiver" }),
+            val(if d.index == crate::hidpp::DIRECT_INDEX {
+                format!("{} ({:04x})", r.kind, r.pid)
+            } else {
+                format!("{} ({:04x}) · slot {}", r.kind, r.pid, d.index)
+            }),
+        ]),
         Line::from(vec![label("kind"), val(d.kind.to_string())]),
         Line::from(vec![label("wireless id"), val(format!("{:04x}", d.wpid))]),
     ];
@@ -219,6 +226,25 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
                 Gauge::default().ratio(ratio).label(text).gauge_style(Style::new().fg(color).bg(THEME.gauge_bg)),
                 gauge_area,
             );
+            // Battery history from the periodic polls, newest on the right.
+            let key = crate::app::device_key(r.pid, d);
+            if let Some(h) = app.history.get(&key).filter(|h| h.len() >= 2) {
+                let spark = Rect { x: gauge_area.x, y: gauge_area.y + 2, width: gauge_area.width, height: 2 };
+                if spark.y + spark.height <= inner.y + inner.height {
+                    let w = spark.width as usize;
+                    let data: Vec<u64> = h.iter().skip(h.len().saturating_sub(w)).map(|&p| p as u64).collect();
+                    let (lo, hi) = (h.iter().min().copied().unwrap_or(0), h.iter().max().copied().unwrap_or(0));
+                    f.render_widget(Sparkline::default().data(&data).max(100).style(Style::new().fg(color)), spark);
+                    let cap = Rect { x: spark.x, y: spark.y + spark.height, width: spark.width, height: 1 };
+                    if cap.y < inner.y + inner.height {
+                        let mins = h.len() * 4 / 60;
+                        f.render_widget(
+                            Paragraph::new(THEME.dim(format!("last {mins} min · {lo}–{hi}%  (toast at {}%)", app.cfg.low_battery_percent))),
+                            cap,
+                        );
+                    }
+                }
+            }
         }
     }
 }

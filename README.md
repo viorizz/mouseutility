@@ -41,7 +41,12 @@ irm https://raw.githubusercontent.com/viorizz/mouseutility/main/install.ps1 | ie
 
 A paired mouse that is asleep or switched off shows as **offline**; the panel
 re-polls every few seconds and picks it up when it wakes. Unifying,
-Lightspeed and Bolt receivers are recognised.
+Lightspeed and Bolt receivers are recognised; a mouse plugged in over USB or
+paired over Bluetooth is listed on its own (experimental, read-only).
+
+The details panel keeps a battery sparkline from those polls, and when a mouse
+drops to `low_battery_percent` (config, default 20) while discharging you get a
+Windows toast — once per session, per device.
 
 Setting DPI or report rate writes straight to the mouse, reads the value
 back, and logs the change. Values you type are snapped to the nearest step the
@@ -64,6 +69,9 @@ CLI: `mouseutility --list` prints receivers and devices and exits;
 `--set-dpi <dpi>` / `--set-rate <hz>` change the first online mouse;
 `--call <feature-hex> <fn> [hex bytes…]` sends a raw HID++ 2.0 call (debugging);
 `--version`, `--update`, `--no-update-check` as in every *Utility tool.
+
+Config lives in `%APPDATA%\mouseutility\config.json`: `auto_update`, `notify`,
+`low_battery_percent`.
 
 ## Build
 

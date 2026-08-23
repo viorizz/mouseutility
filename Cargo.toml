@@ -1,6 +1,6 @@
 [package]
 name = "mouseutility"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A terminal mouse utility for Windows: see your Logitech receivers and mice — battery, DPI, report rate — and set DPI and report rate from a beautiful TUI."
 license = "MIT"

@@ -65,7 +65,11 @@ fn list() -> anyhow::Result<()> {
         println!("{} {:04x} {}", r.kind(), r.pid, r.product);
         for d in r.devices() {
             let state = if d.online { "online" } else { "offline" };
-            println!("  slot {} {:<8} {:<20} wpid {:04x}  {state}", d.index, d.kind, d.paired_name, d.wpid);
+            if d.index == hidpp::DIRECT_INDEX {
+                println!("  direct {:<8} {:<20} pid {:04x}  {state}", d.kind, d.paired_name, d.wpid);
+            } else {
+                println!("  slot {} {:<8} {:<20} wpid {:04x}  {state}", d.index, d.kind, d.paired_name, d.wpid);
+            }
             if let Some(n) = &d.name {
                 println!("         name: {n}");
             }
