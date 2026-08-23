@@ -11,7 +11,7 @@ use crate::hidpp::{ChargeState, Device};
 
 pub const THEME: Theme = Theme::MOUSE;
 
-pub const HINTS: &[Hint] = &[("↑↓", "select"), ("d", "dpi"), ("p", "rate"), ("r", "rescan"), ("U", "update"), ("c", "log"), ("?", "help"), ("q", "quit")];
+pub const HINTS: &[Hint] = &[("↑↓", "select"), ("d", "dpi"), ("p", "rate"), ("o", "levels"), ("r", "rescan"), ("U", "update"), ("c", "log"), ("?", "help"), ("q", "quit")];
 
 /// A small mouse, top view.
 const MOUSE_ART: [&str; 9] = [
@@ -44,6 +44,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::None => {}
         Modal::Dpi { input } => draw_dpi(f, area, app, input),
         Modal::Rate { sel } => draw_rate(f, area, app, *sel),
+        Modal::Levels { sel, input } => draw_levels(f, area, app, *sel, input),
     }
 }
 
@@ -306,5 +307,60 @@ fn draw_rate(f: &mut Frame, area: Rect, app: &App, sel: usize) {
         Line::from(THEME.dim("  Higher rates cost battery; applies to the active link.")),
         Line::from(vec![THEME.key("  Enter"), THEME.dim(" apply   "), THEME.key("←→"), THEME.dim(" choose   "), THEME.key("Esc"), THEME.dim(" cancel")]),
     ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_levels(f: &mut Frame, area: Rect, app: &App, sel: usize, input: &str) {
+    let inner = modal_block(f, area, 62, 12, "Onboard DPI levels", THEME.accent);
+    let Some((_, d)) = app.selected() else { return };
+    let Some(dpi) = &d.dpi else { return };
+    let name = d.name.clone().unwrap_or_else(|| d.paired_name.clone());
+    let mut row = vec![THEME.dim("  ")];
+    for (i, p) in dpi.presets.iter().enumerate() {
+        let s = format!(" {p} ");
+        row.push(if i == sel {
+            Span::styled(s, Style::new().fg(THEME.text).bg(THEME.sel_bg).bold())
+        } else if *p == dpi.current {
+            Span::styled(s, Style::new().fg(THEME.accent))
+        } else {
+            THEME.dim(s)
+        });
+        row.push(Span::raw(" "));
+    }
+    let typed: Option<u16> = input.parse().ok();
+    let snapped = typed.map(|v| dpi.snap(v));
+    let mut lines = vec![
+        Line::from(vec![THEME.dim("  "), Span::styled(name, Style::new().fg(THEME.text).bold()), THEME.dim(format!("  now {} dpi", dpi.current))]),
+        Line::from(""),
+        Line::from(row),
+        Line::from(""),
+    ];
+    if input.is_empty() {
+        lines.push(Line::from(THEME.dim("  Enter makes this level the active DPI. Type a value to")));
+        lines.push(Line::from(THEME.dim("  rewrite the level in the mouse's stored profile instead.")));
+    } else {
+        lines.push(Line::from(vec![
+            THEME.dim(format!("  rewrite level {} to  ", sel + 1)),
+            Span::styled(format!("{input}▏"), Style::new().fg(THEME.text).bold()),
+            match (typed, snapped) {
+                (Some(t), Some(sn)) if sn != t => Span::styled(format!("  → {sn} (nearest supported)"), Style::new().fg(THEME.warn)),
+                (None, _) => Span::styled("  not a number", Style::new().fg(THEME.err)),
+                _ => Span::raw(""),
+            },
+        ]));
+        lines.push(Line::from(THEME.dim("  This edits the profile stored on the mouse itself.")));
+    }
+    if d.onboard_mode == Some(2) {
+        lines.push(Line::from(THEME.dim("  Profiles are in host mode — a picked level is set as plain DPI.")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        THEME.key("  Enter"),
+        THEME.dim(" apply   "),
+        THEME.key("←→"),
+        THEME.dim(" level   "),
+        THEME.key("Esc"),
+        THEME.dim(" cancel"),
+    ]));
     f.render_widget(Paragraph::new(lines), inner);
 }

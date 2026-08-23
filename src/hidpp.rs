@@ -287,6 +287,100 @@ impl Link {
         let f = self.feature_index(idx, 0x8100).ok()?;
         self.call(idx, f, 2, &[]).ok().map(|r| r[0])
     }
+
+    /// First enabled sector in the profile directory (sector 0), if any.
+    pub fn active_profile_sector(&self, idx: u8) -> Result<Option<u16>> {
+        let f = self.feature_index(idx, 0x8100)?;
+        let r = self.call(idx, f, 5, &[0, 0, 0, 0])?;
+        for e in r.chunks(4) {
+            if e.len() < 3 || (e[0] == 0xff && e[1] == 0xff) {
+                break;
+            }
+            if e[2] != 0 {
+                return Ok(Some(u16::from_be_bytes([e[0], e[1]])));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read the accessible part of a profile sector. The G PRO X2 exposes
+    /// [`PROFILE_LEN`] bytes; the trailing checksum word is firmware-managed
+    /// and neither readable nor writable.
+    pub fn read_profile(&self, idx: u8, sector: u16) -> Result<Vec<u8>> {
+        let f = self.feature_index(idx, 0x8100)?;
+        let [sh, sl] = sector.to_be_bytes();
+        let mut out = vec![0u8; PROFILE_LEN];
+        let mut off = 0usize;
+        while off < PROFILE_LEN {
+            let off16 = off.min(PROFILE_LEN - 16);
+            let [oh, ol] = (off16 as u16).to_be_bytes();
+            let r = self.call(idx, f, 5, &[sh, sl, oh, ol])?;
+            out[off16..off16 + 16].copy_from_slice(&r);
+            off = off16 + 16;
+        }
+        Ok(out)
+    }
+
+    /// Rewrite a profile sector (startWrite / writeData… / endWrite). The
+    /// firmware validates the length and keeps its own checksum.
+    pub fn write_profile(&self, idx: u8, sector: u16, data: &[u8]) -> Result<()> {
+        if data.len() != PROFILE_LEN {
+            return Err(HidppError::V2(0x02));
+        }
+        let f = self.feature_index(idx, 0x8100)?;
+        let [sh, sl] = sector.to_be_bytes();
+        let [ch, cl] = (PROFILE_LEN as u16).to_be_bytes();
+        self.call(idx, f, 6, &[sh, sl, 0, 0, ch, cl])?;
+        for chunk in data.chunks(16) {
+            self.call(idx, f, 7, chunk)?;
+        }
+        self.call(idx, f, 8, &[])?;
+        Ok(())
+    }
+
+    /// Current onboard DPI level index (0x8100 getCurrentDpiIndex).
+    pub fn current_dpi_index(&self, idx: u8) -> Result<u8> {
+        let f = self.feature_index(idx, 0x8100)?;
+        Ok(self.call(idx, f, 11, &[])?[0])
+    }
+
+    /// Switch the active onboard DPI level (0x8100 setCurrentDpiIndex) —
+    /// only meaningful while the mouse is in onboard mode.
+    pub fn set_current_dpi_index(&self, idx: u8, level: u8) -> Result<()> {
+        let f = self.feature_index(idx, 0x8100)?;
+        self.call(idx, f, 12, &[level])?;
+        Ok(())
+    }
+}
+
+/// Accessible bytes of a G PRO X2 profile record (the 0x100-byte record
+/// minus the firmware-managed checksum word).
+pub const PROFILE_LEN: usize = 0xfe;
+/// Offset of the five 5-byte DPI level entries in a profile record.
+const PROFILE_DPI_OFFSET: usize = 4;
+/// DPI levels a profile stores.
+pub const PROFILE_LEVELS: usize = 5;
+
+/// The onboard DPI levels of one profile record (x == y is assumed; both
+/// axes are written).
+pub fn profile_levels(data: &[u8]) -> Vec<u16> {
+    data[PROFILE_DPI_OFFSET..]
+        .chunks(5)
+        .take(PROFILE_LEVELS)
+        .filter(|c| c.len() == 5)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&v| v != 0 && v != 0xffff)
+        .collect()
+}
+
+/// Replace level `i` in a profile record (both axes, LOD kept).
+pub fn set_profile_level(data: &mut [u8], i: usize, dpi: u16) {
+    let o = PROFILE_DPI_OFFSET + i * 5;
+    let [lo, hi] = dpi.to_le_bytes();
+    data[o] = lo;
+    data[o + 1] = hi;
+    data[o + 2] = lo;
+    data[o + 3] = hi;
 }
 
 /// 0x8061 rate code → Hz: 0=8ms 1=4ms 2=2ms 3=1ms 4=500µs 5=250µs 6=125µs.
@@ -648,6 +742,22 @@ mod tests {
         let dpi = Dpi { segments: segs, ..Default::default() };
         assert_eq!(dpi.snap(1000), 800);
         assert_eq!(dpi.snap(1300), 1600);
+    }
+
+    #[test]
+    fn profile_level_roundtrip() {
+        // Prefix of a captured G PRO X2 profile record: rates, indices, then
+        // five (x, y, lod) little-endian DPI entries.
+        let mut rec = vec![0x03, 0x03, 0x00, 0x00];
+        for dpi in [800u16, 1200, 1600, 2400, 3200] {
+            let [lo, hi] = dpi.to_le_bytes();
+            rec.extend_from_slice(&[lo, hi, lo, hi, 0x02]);
+        }
+        rec.resize(PROFILE_LEN, 0xff);
+        assert_eq!(profile_levels(&rec), vec![800, 1200, 1600, 2400, 3200]);
+        set_profile_level(&mut rec, 2, 1650);
+        assert_eq!(profile_levels(&rec), vec![800, 1200, 1650, 2400, 3200]);
+        assert_eq!(rec[4 + 2 * 5 + 4], 0x02, "lod untouched");
     }
 
     #[test]

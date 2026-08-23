@@ -62,6 +62,9 @@ pub enum Modal {
     Dpi { input: String },
     /// Pick a report rate from the supported list.
     Rate { sel: usize },
+    /// Onboard DPI levels: pick one to make it active, or type a new value
+    /// to rewrite that level in the mouse's stored profile.
+    Levels { sel: usize, input: String },
 }
 
 pub struct App {
@@ -183,6 +186,10 @@ impl App {
                 self.on_key_rate(k, sel);
                 return true;
             }
+            Modal::Levels { sel, input } => {
+                self.on_key_levels(k, sel, input);
+                return true;
+            }
             Modal::None => {}
         }
         let n = self.devices().len();
@@ -208,6 +215,15 @@ impl App {
                 }
                 Some((_, d)) if !d.online => self.shell.set_status("device is offline — move the mouse to wake it", true),
                 _ => self.shell.set_status("this device does not expose an adjustable DPI", true),
+            },
+            KeyCode::Char('o') => match self.selected() {
+                Some((_, d)) if d.online && d.onboard_mode.is_some() && d.dpi.as_ref().is_some_and(|x| !x.presets.is_empty()) => {
+                    let dpi = d.dpi.as_ref().unwrap();
+                    let sel = dpi.presets.iter().position(|&p| p == dpi.current).unwrap_or(0);
+                    self.modal = Modal::Levels { sel, input: String::new() };
+                }
+                Some((_, d)) if !d.online => self.shell.set_status("device is offline — move the mouse to wake it", true),
+                _ => self.shell.set_status("this device does not expose onboard DPI levels", true),
             },
             KeyCode::Char('p') => match self.selected() {
                 Some((_, d)) if d.online && d.report_rate.as_ref().is_some_and(|r| !r.supported.is_empty()) => {
@@ -294,6 +310,52 @@ impl App {
             _ => {}
         }
         self.modal = Modal::Rate { sel };
+    }
+
+    fn on_key_levels(&mut self, k: KeyEvent, mut sel: usize, mut input: String) {
+        let target = self.selected().map(|(ri, d)| (self.receivers[ri].pid, d.clone()));
+        let (presets, dpi) = match target.as_ref().and_then(|(_, d)| d.dpi.clone()) {
+            Some(dpi) => (dpi.presets.clone(), dpi),
+            None => return,
+        };
+        match k.code {
+            KeyCode::Esc => return,
+            KeyCode::Left | KeyCode::Up => sel = sel.saturating_sub(1),
+            KeyCode::Right | KeyCode::Down => sel = (sel + 1).min(presets.len().saturating_sub(1)),
+            KeyCode::Char(c) if !c.is_ascii_digit() => {}
+            KeyCode::Char(_) if input.len() >= 5 => {}
+            KeyCode::Char(_) | KeyCode::Backspace => {
+                shell::edit_key(&mut input, &k);
+            }
+            KeyCode::Enter => {
+                let Some((pid, d)) = target else { return };
+                if input.is_empty() {
+                    // Make the selected level the active DPI.
+                    let Some(&value) = presets.get(sel) else { return };
+                    let onboard = d.onboard_mode == Some(1);
+                    let level = sel as u8;
+                    self.start_write(
+                        move |r| {
+                            let mut d = d;
+                            if onboard {
+                                apply_level_select(r, &mut d, level, value)
+                            } else {
+                                apply_dpi(r, &mut d, &dpi, value)
+                            }
+                        },
+                        pid,
+                    );
+                } else {
+                    let Ok(v) = input.parse::<u16>() else { return };
+                    let v = dpi.snap(v);
+                    let level = sel as u8;
+                    self.start_write(move |r| apply_level_edit(r, &d.clone(), level, v), pid);
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.modal = Modal::Levels { sel, input };
     }
 
     /// Append this scan's battery readings to the history and raise the
@@ -422,6 +484,41 @@ pub fn apply_rate(r: &HidReceiver, d: &mut Device, hz: u16) -> Result<String, St
     Ok(format!("report rate {old} → {hz} Hz"))
 }
 
+/// Switch the active onboard DPI level (onboard mode only) and read back.
+pub fn apply_level_select(r: &HidReceiver, d: &mut Device, level: u8, value: u16) -> Result<String, String> {
+    r.link.set_current_dpi_index(d.index, level).map_err(|e| format!("set level: {e}"))?;
+    let now = r.link.current_dpi_index(d.index).map_err(|e| format!("read back: {e}"))?;
+    logger::log(format!("onboard dpi level: slot {} → {level} (device reports {now})", d.index));
+    if now != level {
+        return Err(format!("device kept level {now} instead of {level}"));
+    }
+    Ok(format!("onboard DPI level {} → {value} dpi", level + 1))
+}
+
+/// Rewrite one DPI level in the enabled onboard profile and verify.
+pub fn apply_level_edit(r: &HidReceiver, d: &Device, level: u8, value: u16) -> Result<String, String> {
+    let sector = r
+        .link
+        .active_profile_sector(d.index)
+        .map_err(|e| format!("profile directory: {e}"))?
+        .ok_or("no enabled onboard profile")?;
+    let mut rec = r.link.read_profile(d.index, sector).map_err(|e| format!("read profile: {e}"))?;
+    let before = hidpp::profile_levels(&rec);
+    let old = before.get(level as usize).copied().unwrap_or(0);
+    hidpp::set_profile_level(&mut rec, level as usize, value);
+    r.link.write_profile(d.index, sector, &rec).map_err(|e| format!("write profile: {e}"))?;
+    let after = r.link.read_profile(d.index, sector).map_err(|e| format!("read back: {e}"))?;
+    logger::log(format!(
+        "profile {sector:#06x}: level {} {old} → {value}; levels now {:?}",
+        level + 1,
+        hidpp::profile_levels(&after)
+    ));
+    if after != rec {
+        return Err("profile read-back differs from what was written".into());
+    }
+    Ok(format!("onboard level {} rewritten: {old} → {value} dpi", level + 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +588,19 @@ mod tests {
         assert!(matches!(a.modal, Modal::None) && !a.shell.quit);
         shell::handle_key(&mut a, key('q'));
         assert!(a.shell.quit);
+    }
+
+    #[test]
+    fn levels_modal_opens_on_current_and_keeps_q() {
+        let mut a = app();
+        shell::handle_key(&mut a, key('o'));
+        assert!(matches!(a.modal, Modal::Levels { sel: 1, .. }), "opens on the current 1600 level");
+        shell::handle_key(&mut a, key('2'));
+        shell::handle_key(&mut a, key('q'));
+        assert!(!a.shell.quit, "digits-only input ignores q");
+        assert!(matches!(&a.modal, Modal::Levels { input, .. } if input == "2"));
+        let out = shell::snapshot(&mut a, 110, 30, Duration::ZERO).unwrap();
+        assert!(out.contains("Onboard DPI levels"), "{out}");
     }
 
     #[test]
